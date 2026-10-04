@@ -43131,6 +43131,7 @@ ${problems.join("\n")}`, {
 }
 
 // src/plan/policy.ts
+var CHILD_RESOURCE_FIELDS = /* @__PURE__ */ new Set(["exists", "member"]);
 var HOUR_MS = 60 * 60 * 1e3;
 var CLOCK_TOLERANCE_MS = 5 * 60 * 1e3;
 function object2(value) {
@@ -43300,19 +43301,13 @@ function evaluatePolicy(input2) {
   rule("conflicting_actions", (deny) => {
     const writers = /* @__PURE__ */ new Map();
     for (const action of plan2.actions) {
-      const key = JSON.stringify([action.target.level, action.target.id]);
-      const previous = writers.get(key) ?? [];
-      for (const other of previous) {
-        const overlap = Object.keys(action.after).filter((field2) => Object.hasOwn(other.after, field2));
-        if (overlap.length > 0) {
-          deny(`The action overlaps writes from action ${other.id}.`, {
-            actionId: action.id,
-            observed: overlap
-          });
-        }
+      for (const field2 of Object.keys(action.after)) {
+        const resource = CHILD_RESOURCE_FIELDS.has(field2) ? `:${canonicalJson(action.params)}` : "";
+        const key = `${JSON.stringify([action.target.level, action.target.id])}:${field2}${resource}`;
+        const other = writers.get(key);
+        if (other === void 0) writers.set(key, action);
+        else deny(`The action overlaps writes from action ${other.id}.`, { actionId: action.id, observed: [field2] });
       }
-      previous.push(action);
-      writers.set(key, previous);
     }
   });
   rule("missing_before", (deny) => {
@@ -44041,7 +44036,10 @@ async function createRevertPlan(planId, runtime) {
 }
 
 // src/plan/preview.ts
-var HINT_DENIED = "The policy denies this plan, so it cannot be applied. Fix the denials below or change the policy in the config file.";
+function deniedHint(policy) {
+  const reasons = [...new Set(policy.results.filter((result) => result.outcome === "deny").map((result) => result.message))];
+  return `The policy denies this plan, so it cannot be applied: ${reasons.join("; ")}`;
+}
 var HINT_AUTO = "Within the auto-apply policy: plan_apply with dryRun false will run it.";
 function orNullWhenMissing(read) {
   try {
@@ -44063,7 +44061,7 @@ function gateAllowsAuto(gate, threshold) {
   return gate !== null && gate.mode === "jev" && gate.verdict === "allow" && gate.actions.every((action) => action.verdict === "allow" && action.confidence >= threshold);
 }
 function approvalFor(planId, policy, auto, receipt) {
-  if (!policy.allowed) return { required: false, satisfiedBy: null, hint: HINT_DENIED };
+  if (!policy.allowed) return { required: false, satisfiedBy: null, hint: deniedHint(policy) };
   if (auto) return { required: false, satisfiedBy: "policy", hint: HINT_AUTO };
   if (receipt !== null) {
     return { required: false, satisfiedBy: receipt.method, hint: `Approved; valid until ${receipt.expiresAt}.` };

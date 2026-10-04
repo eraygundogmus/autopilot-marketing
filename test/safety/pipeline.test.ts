@@ -235,6 +235,38 @@ describe('the policy is enforced by the server', () => {
     expect(policy.denials.map((denial) => denial.ruleId)).toContain('budget_change');
   });
 
+  it('lets one plan add several different negative keywords to a campaign, but not the same one twice', async () => {
+    const { mcp } = await setup({ autonomy: 'approve' });
+    const snapshotId = await snapshot(mcp);
+    const negative = (text: string) => ({
+      kind: 'google_ads.negative_keyword.add',
+      target: { level: 'campaign', id: 'c3' },
+      params: { text, matchType: 'EXACT' },
+      rationale: `The search term "${text}" spent without converting.`,
+    });
+    const created = await mcp.call('plan_create', {
+      accountId: ACCOUNT,
+      snapshotId,
+      title: 'Negatives for one campaign',
+      rationale: 'Three search terms that spent without converting.',
+      actions: [negative('how to make a tent diy'), negative('tent rental near me'), negative('rei camping tents')],
+    });
+    expect(created.isError, created.text).toBe(false);
+    const preview = await mcp.call('plan_preview', { planId: created.structured?.['planId'] });
+    const policy = preview.structured?.['policy'] as { allowed: boolean; denials: Array<{ ruleId: string }> };
+    expect(policy.denials.map((denial) => denial.ruleId)).not.toContain('conflicting_actions');
+    expect(policy.allowed).toBe(true);
+
+    const twice = await mcp.call('plan_create', {
+      accountId: ACCOUNT,
+      snapshotId,
+      title: 'The same negative twice',
+      rationale: 'A duplicate is a mistake in the plan.',
+      actions: [negative('tent rental near me'), negative('tent rental near me')],
+    });
+    expect(twice.isError).toBe(true);
+  });
+
   it('refuses every live change while the kill switch is on', async () => {
     const { runtime, home, mcp } = await setup({ autonomy: 'approve' });
     const planId = await pausePlan(mcp, await snapshot(mcp));

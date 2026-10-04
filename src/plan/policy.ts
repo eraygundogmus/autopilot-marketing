@@ -1,8 +1,11 @@
-import { digest } from '../core/ids';
+import { canonicalJson, digest } from '../core/ids';
 import type {
   AccountConfig, Action, Autonomy, JsonObject, JsonValue, LedgerEntry, Plan, Policy,
   PolicyDecision, PolicyRuleResult, Snapshot,
 } from '../core/types';
+
+/** `after` fields that stand for a child resource identified by the action's params. */
+const CHILD_RESOURCE_FIELDS = new Set(['exists', 'member']);
 
 export interface PolicyInput {
   plan: Plan;
@@ -220,20 +223,18 @@ export function evaluatePolicy(input: PolicyInput): PolicyDecision {
     }
   });
   rule('conflicting_actions', (deny) => {
-    const writers = new Map<string, Action[]>();
+    // Two actions conflict when they write the same thing. For kinds that add or remove a child
+    // resource (a negative keyword, a segment member, an email draft) the thing is that resource,
+    // so several different negatives on one campaign do not conflict.
+    const writers = new Map<string, Action>();
     for (const action of plan.actions) {
-      const key = JSON.stringify([action.target.level, action.target.id]);
-      const previous = writers.get(key) ?? [];
-      for (const other of previous) {
-        const overlap = Object.keys(action.after).filter((field) => Object.hasOwn(other.after, field));
-        if (overlap.length > 0) {
-          deny(`The action overlaps writes from action ${other.id}.`, {
-            actionId: action.id, observed: overlap,
-          });
-        }
+      for (const field of Object.keys(action.after)) {
+        const resource = CHILD_RESOURCE_FIELDS.has(field) ? `:${canonicalJson(action.params)}` : '';
+        const key = `${JSON.stringify([action.target.level, action.target.id])}:${field}${resource}`;
+        const other = writers.get(key);
+        if (other === undefined) writers.set(key, action);
+        else deny(`The action overlaps writes from action ${other.id}.`, { actionId: action.id, observed: [field] });
       }
-      previous.push(action);
-      writers.set(key, previous);
     }
   });
   rule('missing_before', (deny) => {

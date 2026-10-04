@@ -6,8 +6,11 @@ import type {
 import { renderPlanPreview } from '../report/render';
 import { evaluatePolicy } from './policy';
 
-const HINT_DENIED =
-  'The policy denies this plan, so it cannot be applied. Fix the denials below or change the policy in the config file.';
+/** Says why, so the hint stands on its own wherever the full review is not shown. */
+function deniedHint(policy: PolicyDecision): string {
+  const reasons = [...new Set(policy.results.filter((result) => result.outcome === 'deny').map((result) => result.message))];
+  return `The policy denies this plan, so it cannot be applied: ${reasons.join('; ')}`;
+}
 const HINT_AUTO = 'Within the auto-apply policy: plan_apply with dryRun false will run it.';
 
 function orNullWhenMissing<T>(read: () => T): T | null {
@@ -41,7 +44,7 @@ function approvalFor(
   auto: boolean,
   receipt: ApprovalReceipt | null,
 ): PlanPreview['approval'] {
-  if (!policy.allowed) return { required: false, satisfiedBy: null, hint: HINT_DENIED };
+  if (!policy.allowed) return { required: false, satisfiedBy: null, hint: deniedHint(policy) };
   if (auto) return { required: false, satisfiedBy: 'policy', hint: HINT_AUTO };
   if (receipt !== null) {
     return { required: false, satisfiedBy: receipt.method, hint: `Approved; valid until ${receipt.expiresAt}.` };

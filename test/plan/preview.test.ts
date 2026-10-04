@@ -147,11 +147,10 @@ describe('previewPlan', () => {
     expect(preview.policy.allowed).toBe(false);
     expect(preview.gate).toBeNull();
     expect(gatePlan).not.toHaveBeenCalled();
-    expect(preview.approval).toEqual({
-      required: false,
-      satisfiedBy: null,
-      hint: 'The policy denies this plan, so it cannot be applied. Fix the denials below or change the policy in the config file.',
-    });
+    expect(preview.approval.required).toBe(false);
+    expect(preview.approval.satisfiedBy).toBeNull();
+    // The hint names the reason itself: it is shown in places that do not print the full review.
+    expect(preview.approval.hint).toMatch(/^The policy denies this plan, so it cannot be applied: .*autonomy/);
     expect(preview.review).toContain('Policy: deny');
   });
 
