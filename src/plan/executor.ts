@@ -490,6 +490,7 @@ export async function createRevertPlan(planId: string, runtime: Runtime): Promis
     account, snapshot: null, drafts, title: `Revert: ${plan.title}`,
     rationale: `Compensating changes for plan ${plan.id}. Money already spent is not recovered.`,
     createdBy: 'agent', connector, now: runtime.now(), revertsPlanId: plan.id,
+    knownTargets: plan.actions.map((action) => action.target),
   });
   // Planning reads again; a later change must not become permission to overwrite it.
   for (const [index, action] of newPlan.actions.entries()) {

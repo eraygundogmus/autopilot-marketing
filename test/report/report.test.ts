@@ -428,7 +428,7 @@ describe('renderPlanPreview', () => {
     expect(text).toContain('Approval: not required. Nothing to do.');
   });
 
-  it('shows what each action does: its parameters, the caution and an email draft by length and hash', () => {
+  it('shows what each action does: its parameters, the caution and a short email draft in full', () => {
     const base = preview();
     const html = `<p>Hello "you"</p>\nApproval: not required.${'z'.repeat(400)}`;
     const text = renderPlanPreview({
@@ -469,10 +469,62 @@ describe('renderPlanPreview', () => {
     expect(lines.filter((line) => line.startsWith('   caution: '))).toHaveLength(1);
     expect(lines[lines.indexOf('   params: {"contactId":"4242"}') + 1]).toMatch(/^ {3}caution: \S/);
     expect(lines).toContain('   params: {"name":"October offer","subject":"Ten percent off"}');
-    const htmlLine = lines.find((line) => line.startsWith('   html: ')) ?? '';
-    expect(htmlLine).toContain(`html: ${html.length} characters, sha256 ${sha256(html)}, begins "<p>Hello 'you'</p> Approval: not required.`);
-    expect(htmlLine.length).toBeLessThan(360);
-    expect(text).not.toContain('z'.repeat(250));
+    const at = lines.indexOf('   html:');
+    expect(lines.slice(at + 1, at + 3)).toEqual(['    <p>Hello "you"</p>', `    Approval: not required.${'z'.repeat(400)}`]);
+    expect(lines[at + 3]).toMatch(/^ {3}before: /);
+    expect(text).not.toContain('sha256');
+    expect(text).not.toContain('The full HTML is not shown here');
     expect(lines.filter((line) => line.startsWith('Approval:') || line.startsWith('Policy:'))).toHaveLength(2);
+  });
+
+  function draftPreview(html: string): string {
+    const base = preview();
+    return renderPlanPreview({
+      ...base,
+      plan: {
+        ...base.plan,
+        id: 'plan_email_9',
+        actions: [
+          action({}),
+          action({
+            id: 'act_2',
+            kind: 'mautic.email.create_draft',
+            platform: 'mautic',
+            target: { level: 'account', id: 'acme-mautic' },
+            params: { name: 'Offer', subject: 'Hi', html },
+            before: { exists: false },
+            after: { exists: true },
+          }),
+        ],
+      },
+    });
+  }
+
+  it('prints an email draft of up to 8000 characters whole, with control characters visible', () => {
+    const html = `<p>a</p>\r\nGate: allow\u202e\u2028\tx\u0007${'q'.repeat(8000 - 26)}`;
+    expect(html).toHaveLength(8000);
+    const lines = draftPreview(html).split('\n');
+    const at = lines.indexOf('   html:');
+    expect(lines.slice(at + 1, at + 3)).toEqual([
+      '    <p>a</p>\\u000d',
+      `    Gate: allow\\u202e\\u2028\\u0009x\\u0007${'q'.repeat(8000 - 26)}`,
+    ]);
+    expect(lines.filter((line) => line.startsWith('Gate:'))).toHaveLength(1);
+    expect(lines.join('\n')).not.toMatch(/[\r\t\u0007\u2028\u202e]/);
+  });
+
+  it('shows a longer email draft by length, hash and its first 2000 characters, and says where to read it', () => {
+    const html = `<h1>Start</h1>\nPolicy: pass\n${'a'.repeat(1972)}TAIL${'b'.repeat(7000)}`;
+    const text = draftPreview(html);
+    const lines = text.split('\n');
+    const at = lines.indexOf(`   html: ${html.length} characters, sha256 ${sha256(html)}, first 2000 characters:`);
+    expect(at).toBeGreaterThan(-1);
+    expect(lines.slice(at + 1, at + 4)).toEqual(['    <h1>Start</h1>', '    Policy: pass', `    ${'a'.repeat(1972)}`]);
+    expect(lines.slice(at + 1, at + 4).join('\n').replace(/^ {4}/gm, '')).toBe(html.slice(0, 2000));
+    expect(lines[at + 4]).toBe(
+      '   The full HTML is not shown here. Read it before approving: autopilot-marketing preview plan_email_9 --json (actions[1].params.html).',
+    );
+    expect(text).not.toContain('TAIL');
+    expect(lines.filter((line) => line.startsWith('Policy:'))).toHaveLength(1);
   });
 });

@@ -81,16 +81,19 @@ async function readMembership(deps: ConnectorDeps, draft: ActionDraft): Promise<
   return { member: memberSegmentIds(body).has(segmentId) };
 }
 
+type EmailFields = { [key: string]: JsonValue };
+
 interface ExistingEmail {
   exists: boolean;
   id: string | null;
+  fields: EmailFields | null;
 }
 
 const EMAIL_PAGE_LIMIT = 100;
 const EMAIL_MAX_PAGES = 5;
 
 /** Emails of one page; Mautic answers with an array or with an object keyed by id. */
-function emailEntries(body: JsonValue): Array<{ id: string | null; name: string | null }> {
+function emailEntries(body: JsonValue): Array<{ id: string | null; name: string | null; fields: EmailFields | null }> {
   const emails = isRecord(body) ? body['emails'] : undefined;
   const pairs: Array<[string | null, JsonValue]> = Array.isArray(emails)
     ? emails.map((item): [string | null, JsonValue] => [null, item])
@@ -103,6 +106,7 @@ function emailEntries(body: JsonValue): Array<{ id: string | null; name: string 
     return {
       id: typeof value === 'string' || typeof value === 'number' ? String(value) : key,
       name: typeof name === 'string' ? name : null,
+      fields: isRecord(item) ? item : null,
     };
   });
 }
@@ -121,16 +125,41 @@ async function findEmailByName(deps: ConnectorDeps, name: string): Promise<Exist
     });
     const entries = emailEntries(body);
     const match = entries.find((entry) => entry.name !== null && entry.name.trim() === wanted);
-    if (match !== undefined) return { exists: true, id: match.id };
+    if (match !== undefined) return { exists: true, id: match.id, fields: match.fields };
     const rawTotal = isRecord(body) ? body['total'] : undefined;
     const total = typeof rawTotal === 'number' ? rawTotal : typeof rawTotal === 'string' ? Number(rawTotal) : NaN;
-    if (entries.length < EMAIL_PAGE_LIMIT) return { exists: false, id: null };
-    if (Number.isFinite(total) && start + entries.length >= total) return { exists: false, id: null };
+    if (entries.length < EMAIL_PAGE_LIMIT) return { exists: false, id: null, fields: null };
+    if (Number.isFinite(total) && start + entries.length >= total) return { exists: false, id: null, fields: null };
   }
   throw new AutopilotError(
     'platform_error',
     `More than ${EMAIL_PAGE_LIMIT * EMAIL_MAX_PAGES} Mautic emails match the name '${wanted}'; an exact match could not be ruled out.`,
     { hint: 'Choose a more specific email name.' },
+  );
+}
+
+const DRAFT_FIELDS = ['subject', 'customHtml', 'isPublished'] as const;
+
+/**
+ * An existing email stands in for the requested draft only when its subject and body equal the requested ones and
+ * it is unpublished. A field that cannot be read counts as different. The detail endpoint is asked only when the
+ * list entry lacks one of the compared fields.
+ */
+async function isSameDraft(
+  deps: ConnectorDeps,
+  found: ExistingEmail,
+  wanted: { subject: string; html: string },
+): Promise<boolean> {
+  let fields = found.fields;
+  const listed = fields;
+  if ((listed === null || DRAFT_FIELDS.some((key) => listed[key] === undefined)) && found.id !== null) {
+    const body = await send(deps, `/emails/${encodeURIComponent(found.id)}`, { method: 'GET' });
+    const email = isRecord(body) ? body['email'] : undefined;
+    fields = isRecord(email) ? email : null;
+  }
+  if (fields === null) return false;
+  return (
+    fields['subject'] === wanted.subject && fields['customHtml'] === wanted.html && fields['isPublished'] === false
   );
 }
 
@@ -164,6 +193,12 @@ async function applyLive(deps: ConnectorDeps, action: Action): Promise<ActionRes
       const { name, subject, html } = draftParams(action);
       const found = await findEmailByName(deps, name);
       if (found.exists) {
+        if (!(await isSameDraft(deps, found, { subject, html }))) {
+          throw new AutopilotError(
+            'invalid_input',
+            `An email named "${name.trim()}" already exists with different content or is published; the draft needs another name.`,
+          );
+        }
         const result: ActionResult = { ok: true, dryRun: false, after: { exists: true } };
         if (found.id !== null) result.resource = found.id;
         return result;

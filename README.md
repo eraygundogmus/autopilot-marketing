@@ -147,6 +147,8 @@ What the server enforces:
 
 - **Allowlisted typed actions.** Only the action kinds in the table above exist.
 - **Policy limits.** Budget and bid changes, plan size, cooldown and snapshot age are checked against the owner's limits. Money is compared in integer micros (millionths of a currency unit), and rounding never loosens a limit.
+- **Protected entities.** Entities listed under an account's `protected` (ids, names or name patterns such as `*brand*`) cannot be changed. Names and parent campaigns are taken from the snapshot, never from what the caller supplied, so a plan for an account with protected entities must be created from a snapshot.
+- **Account binding.** A snapshot must belong to the same account as the plan, and a Meta entity is checked against the configured ad account before it is read or changed, because one access token often reaches several accounts.
 - **Bound approvals.** An approval receipt is bound to the plan digest, the policy digest and the exact review text. It can be used for one execution and it expires.
 - **Fresh state.** The target's state is read again before each change, and the change is skipped if it differs from what the plan recorded.
 - **No blind retry.** When the outcome of a change cannot be confirmed, it is recorded as `unknown`, and that entity is blocked until a fresh read settles it.

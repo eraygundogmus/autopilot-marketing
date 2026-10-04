@@ -1051,6 +1051,26 @@ describe('createRevertPlan', () => {
     await expect(applyPlan(revert.id, f.runtime, LIVE)).rejects.toMatchObject({ code: 'policy_denied' });
   });
 
+  it.each([
+    { name: 'Generic Search', denied: false },
+    { name: 'Acme Brand Search', denied: true },
+  ])('keeps the target name so the protected list decides a revert of $name', async ({ name, denied }) => {
+    const lower = buildAction({
+      kind: 'google_ads.campaign.set_daily_budget', target: { level: 'campaign', id: 'c1', name },
+      params: { dailyBudget: 50 }, rationale: 'Lower the reviewed budget.',
+    }, { dailyBudget: 60 });
+    const f = fixture([lower]);
+    f.approve();
+    await applyPlan(f.plan.id, f.runtime, LIVE);
+    expect(f.apply).toHaveBeenCalledTimes(1);
+    f.account.protected = ['*brand*'];
+    const revert = await createRevertPlan(f.plan.id, f.runtime);
+    expect(revert.actions[0]?.target).toEqual({ level: 'campaign', id: 'c1', name });
+    const note = (await applyPlan(revert.id, f.runtime, DRY)).results[0]?.note ?? '';
+    expect(note).not.toContain('could not be checked against the protected list');
+    expect(note.includes('targets a protected entity')).toBe(denied);
+  });
+
   it('requires fresh approval for a revert that passes policy', async () => {
     const membership = buildAction({
       kind: 'mautic.segment.add_contact', target: { level: 'segment', id: 'segment-1' },

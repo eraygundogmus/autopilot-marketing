@@ -45,8 +45,10 @@ interface Loaded {
   insights: Raw[];
   build(conversionAction: string | undefined): Row[];
   truncated: boolean;
-  /** Rows whose entity the list call no longer returns (archived or deleted). */
+  /** Rows whose entity is absent from the entity list. */
   unlisted: number;
+  /** False when the entity list was cut off: an absent entity may then simply sit on an unread page. */
+  listComplete: boolean;
 }
 
 function isRecord(value: unknown): value is Raw {
@@ -246,6 +248,8 @@ export async function fetchMetaAdsSnapshot(deps: ConnectorDeps, request: Snapsho
     }
     const unlistedIds = [...byId.keys()].filter((id) => !listed.has(id));
     // Every Insights row becomes a dataset row: the list edges omit archived entities, their spend still counts.
+    // Absence from the list proves removal only when the list was read to its end.
+    const unlistedStatus: AttrValue = entities.truncated ? null : 'REMOVED';
     const build = (conversionAction: string | undefined): Row[] => {
       const rows: Row[] = [];
       for (const entity of entities.rows) {
@@ -262,7 +266,7 @@ export async function fetchMetaAdsSnapshot(deps: ConnectorDeps, request: Snapsho
         const row: Row = {
           id,
           metrics: insightMetrics(insight, conversionAction),
-          attrs: { status: 'REMOVED', ...deliveryAttrs(insight) },
+          attrs: { status: unlistedStatus, ...deliveryAttrs(insight) },
         };
         const name = text(insight[nameField]);
         if (name !== undefined) row.name = name;
@@ -278,7 +282,13 @@ export async function fetchMetaAdsSnapshot(deps: ConnectorDeps, request: Snapsho
       }
       return rows;
     };
-    return { insights: stats.rows, build, truncated: entities.truncated || stats.truncated, unlisted: unlistedIds.length };
+    return {
+      insights: stats.rows,
+      build,
+      truncated: entities.truncated || stats.truncated,
+      unlisted: unlistedIds.length,
+      listComplete: !entities.truncated,
+    };
   };
 
   const base = (entity: Raw, id: string): Row => {
@@ -367,7 +377,7 @@ export async function fetchMetaAdsSnapshot(deps: ConnectorDeps, request: Snapsho
         }
         return rows;
       };
-      return { insights: stats.rows, build, truncated: stats.truncated, unlisted: 0 };
+      return { insights: stats.rows, build, truncated: stats.truncated, unlisted: 0, listComplete: true };
     },
     daily: async () => {
       const stats = await insights('account', '', { time_increment: 1 });
@@ -381,7 +391,7 @@ export async function fetchMetaAdsSnapshot(deps: ConnectorDeps, request: Snapsho
         rows.sort((a, b) => a.id.localeCompare(b.id));
         return rows;
       };
-      return { insights: stats.rows, build, truncated: stats.truncated, unlisted: 0 };
+      return { insights: stats.rows, build, truncated: stats.truncated, unlisted: 0, listComplete: true };
     },
   };
 
@@ -430,8 +440,11 @@ export async function fetchMetaAdsSnapshot(deps: ConnectorDeps, request: Snapsho
       warnings.push(`${name}: ${note}`);
     }
     if (loaded.unlisted > 0) {
+      const subject = `${loaded.unlisted} ${loaded.unlisted === 1 ? 'row comes from an entity' : 'rows come from entities'}`;
       notes.push(
-        `${loaded.unlisted} ${loaded.unlisted === 1 ? 'row comes from an entity' : 'rows come from entities'} no longer listed (archived or deleted).`,
+        loaded.listComplete
+          ? `${subject} no longer listed (archived or deleted).`
+          : `${subject} not in the listed pages; ${loaded.unlisted === 1 ? 'its' : 'their'} status is unknown.`,
       );
     }
     if (notes.length > 0) {

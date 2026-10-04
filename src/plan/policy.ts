@@ -195,12 +195,12 @@ export function evaluatePolicy(input: PolicyInput): PolicyDecision {
   rule('protected_entity', (deny) => {
     const protectedEntities = account.protected ?? [];
     if (protectedEntities.length === 0) return;
-    const needsName = protectedEntities.some((pattern) => pattern.includes('*'));
     for (const action of plan.actions) {
       const { target } = action;
       const needsCampaign = target.level === 'ad_group' || target.level === 'ad' || target.level === 'keyword';
-      if ((needsName && !target.name) || (needsCampaign && !target.campaignId)) {
-        deny('The target could not be checked against the protected list; the plan must be created from a fresh snapshot.', {
+      // Any entry may be a name, exact or glob, so a target without a name cannot be cleared.
+      if (!target.name || (needsCampaign && !target.campaignId)) {
+        deny('The target could not be checked against the protected list; create the plan from a fresh snapshot.', {
           actionId: action.id, observed: target.id,
         });
         continue;
@@ -259,6 +259,11 @@ export function evaluatePolicy(input: PolicyInput): PolicyDecision {
     if (snapshot === null) return;
     if (snapshot.accountId !== plan.accountId || snapshot.platform !== plan.platform) {
       deny('The snapshot account and platform must match the plan.');
+    }
+    if (snapshot.externalAccountId !== account.externalId) {
+      deny('The snapshot was read from a different platform account than the one configured; create a fresh snapshot.', {
+        observed: snapshot.externalAccountId, limit: account.externalId,
+      });
     }
     if (snapshot.source !== 'api' && account.source !== 'demo') {
       deny('Live changes need a snapshot read from the platform API; a CSV import can be audited but cannot back a change.');

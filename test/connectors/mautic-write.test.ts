@@ -56,6 +56,10 @@ function toAction(draft: ActionDraft): Action {
   } as Action;
 }
 
+function existing(overrides: JsonObject = {}): JsonObject {
+  return { id: 12, name: 'Welcome "A"', subject: 'Hi', customHtml: '<p>Hi</p>', isPublished: false, ...overrides };
+}
+
 const live = { validateOnly: false, idempotencyKey: 'k' };
 const dry = { validateOnly: true, idempotencyKey: 'k' };
 const posts = (calls: HttpRequest[]): HttpRequest[] => calls.filter((call) => call.method === 'POST');
@@ -146,10 +150,55 @@ describe('applyMauticAction', () => {
   });
 
   it('does not create a second email with the same name', async () => {
-    const { deps, calls } = makeDeps(() => ({ total: 1, emails: { '12': { id: 12, name: 'Welcome "A"' } } }));
+    const { deps, calls } = makeDeps(() => ({ total: 1, emails: { '12': existing() } }));
     const result = await applyMauticAction(deps, toAction(emailDraft()), live);
-    expect(result).toMatchObject({ ok: true, dryRun: false, resource: '12' });
+    expect(result).toMatchObject({ ok: true, dryRun: false, after: { exists: true }, resource: '12' });
     expect(posts(calls)).toHaveLength(0);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('refuses a same-named email with a different subject or body', async () => {
+    for (const change of [{ subject: 'Other' }, { customHtml: '<p>Other</p>' }]) {
+      const { deps, calls } = makeDeps(() => ({ total: 1, emails: [existing(change)] }));
+      await expect(readMauticState(deps, emailDraft())).resolves.toEqual({ exists: true });
+      const result = await applyMauticAction(deps, toAction(emailDraft()), live);
+      expect(result).toEqual({
+        ok: false,
+        dryRun: false,
+        after: null,
+        error: {
+          code: 'invalid_input',
+          message: expect.stringContaining('An email named "Welcome "A"" already exists'),
+          retryable: false,
+        },
+      });
+      expect(result.error?.message).toContain('another name');
+      expect(calls.every((call) => call.method === 'GET')).toBe(true);
+    }
+  });
+
+  it('refuses a same-named email that is published', async () => {
+    const { deps, calls } = makeDeps(() => ({ total: 1, emails: [existing({ isPublished: true })] }));
+    const result = await applyMauticAction(deps, toAction(emailDraft()), live);
+    expect(result).toMatchObject({ ok: false, dryRun: false, after: null, error: { code: 'invalid_input' } });
+    expect(calls.every((call) => call.method === 'GET')).toBe(true);
+  });
+
+  it('reads the email itself when the list entry lacks the compared fields', async () => {
+    const handler = (email: JsonObject): Handler => (request) =>
+      request.url.endsWith('/emails/12') ? { email } : { total: 1, emails: [{ id: 12, name: 'Welcome "A"' }] };
+    const same = makeDeps(handler(existing()));
+    await expect(applyMauticAction(same.deps, toAction(emailDraft()), live)).resolves.toMatchObject({
+      ok: true,
+      resource: '12',
+    });
+    const published = makeDeps(handler(existing({ isPublished: true })));
+    await expect(applyMauticAction(published.deps, toAction(emailDraft()), live)).resolves.toMatchObject({
+      ok: false,
+      error: { code: 'invalid_input' },
+    });
+    expect(same.calls.map((call) => call.method)).toEqual(['GET', 'GET']);
+    expect(published.calls.map((call) => call.method)).toEqual(['GET', 'GET']);
   });
 
   it('creates "Welcome" although "Welcome 2025" matches the substring search', async () => {
@@ -171,7 +220,7 @@ describe('applyMauticAction', () => {
     const { deps, calls } = makeDeps((request) =>
       request.url.endsWith('&start=0')
         ? { total: 101, emails: page(1) }
-        : { total: 101, emails: { '500': { id: 500, name: 'Welcome' } } },
+        : { total: 101, emails: { '500': existing({ id: 500, name: 'Welcome' }) } },
     );
     const draft = emailDraft({ name: 'Welcome', subject: 'Hi', html: '<p>Hi</p>' });
     await expect(readMauticState(deps, draft)).resolves.toEqual({ exists: true });

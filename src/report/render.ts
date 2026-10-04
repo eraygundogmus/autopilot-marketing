@@ -27,29 +27,46 @@ export function accountText(text: string, max: number = MAX_ACCOUNT_TEXT): strin
   return `"${inert(text, max)}"`;
 }
 
-/** Canonical JSON, with the invisible characters JSON leaves raw (line separators, bidi controls) escaped. */
-function literalJson(value: unknown): string {
-  return canonicalJson(value).replace(
-    /[\p{Cf}\u2028\u2029]/gu,
-    (char) => `\\u${(char.codePointAt(0) ?? 0).toString(16).padStart(4, '0')}`,
-  );
+/** Control and invisible format characters (line separators, bidi controls) as visible \uXXXX escapes. */
+function visible(text: string, pattern: RegExp): string {
+  return text.replace(pattern, (char) => `\\u${(char.codePointAt(0) ?? 0).toString(16).padStart(4, '0')}`);
 }
 
-const HTML_EXCERPT_CHARS = 200;
+/** Canonical JSON, with the invisible characters JSON leaves raw (line separators, bidi controls) escaped. */
+function literalJson(value: unknown): string {
+  return visible(canonicalJson(value), /[\p{Cf}\u2028\u2029]/gu);
+}
+
+const HTML_FULL_CHARS = 8000;
+const HTML_EXCERPT_CHARS = 2000;
 
 /**
- * What the action does, complete: every parameter as canonical JSON. An email body is identified by
- * its length and sha256 and shown by its first characters, quoted as data; every other value is whole.
+ * Agent-written text as an indented block: every line starts with four spaces, so no line of it can
+ * pass for a line of the review, and every control or format character other than the newline is a
+ * visible escape.
  */
-function paramLines(action: Action): string[] {
+function dataBlock(text: string): string[] {
+  return text.split('\n').map((line) => `    ${visible(line, /[\p{Cc}\p{Cf}\u2028\u2029]/gu)}`);
+}
+
+/**
+ * What the action does, complete: every parameter as canonical JSON. An email body is printed whole
+ * as a data block up to HTML_FULL_CHARS; a longer one is identified by its length and sha256, shown
+ * by its first characters, and the reader is told where to read all of it.
+ */
+function paramLines(action: Action, index: number, planId: string): string[] {
   const html = action.params['html'];
   if (action.kind !== 'mautic.email.create_draft' || typeof html !== 'string') {
     return [`   params: ${literalJson(action.params)}`];
   }
   const rest = Object.fromEntries(Object.entries(action.params).filter(([key]) => key !== 'html'));
+  const params = `   params: ${literalJson(rest)}`;
+  if (html.length <= HTML_FULL_CHARS) return [params, '   html:', ...dataBlock(html)];
   return [
-    `   params: ${literalJson(rest)}`,
-    `   html: ${html.length} characters, sha256 ${sha256(html)}, begins ${accountText(html, HTML_EXCERPT_CHARS)}`,
+    params,
+    `   html: ${html.length} characters, sha256 ${sha256(html)}, first ${HTML_EXCERPT_CHARS} characters:`,
+    ...dataBlock(html.slice(0, HTML_EXCERPT_CHARS)),
+    `   The full HTML is not shown here. Read it before approving: autopilot-marketing preview ${planId} --json (actions[${index}].params.html).`,
   ];
 }
 
@@ -211,7 +228,7 @@ export function renderPlanPreview(
       '',
       `${index + 1}. ${action.kind} [${action.id}]`,
       `   entity: ${entityText(action.target)}`,
-      ...paramLines(action),
+      ...paramLines(action, index, plan.id),
       ...(caution === undefined ? [] : [`   caution: ${caution}`]),
       `   before: ${action.before === null ? 'unknown (could not be read)' : literalJson(action.before)}`,
       `   after: ${literalJson(action.after)}`,

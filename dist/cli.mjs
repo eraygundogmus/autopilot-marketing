@@ -22671,7 +22671,8 @@ function emailEntries(body) {
     const name = isRecord5(item) ? item["name"] : void 0;
     return {
       id: typeof value === "string" || typeof value === "number" ? String(value) : key,
-      name: typeof name === "string" ? name : null
+      name: typeof name === "string" ? name : null,
+      fields: isRecord5(item) ? item : null
     };
   });
 }
@@ -22685,17 +22686,29 @@ async function findEmailByName(deps, name) {
     });
     const entries = emailEntries(body);
     const match = entries.find((entry) => entry.name !== null && entry.name.trim() === wanted);
-    if (match !== void 0) return { exists: true, id: match.id };
+    if (match !== void 0) return { exists: true, id: match.id, fields: match.fields };
     const rawTotal = isRecord5(body) ? body["total"] : void 0;
     const total = typeof rawTotal === "number" ? rawTotal : typeof rawTotal === "string" ? Number(rawTotal) : NaN;
-    if (entries.length < EMAIL_PAGE_LIMIT) return { exists: false, id: null };
-    if (Number.isFinite(total) && start + entries.length >= total) return { exists: false, id: null };
+    if (entries.length < EMAIL_PAGE_LIMIT) return { exists: false, id: null, fields: null };
+    if (Number.isFinite(total) && start + entries.length >= total) return { exists: false, id: null, fields: null };
   }
   throw new AutopilotError(
     "platform_error",
     `More than ${EMAIL_PAGE_LIMIT * EMAIL_MAX_PAGES} Mautic emails match the name '${wanted}'; an exact match could not be ruled out.`,
     { hint: "Choose a more specific email name." }
   );
+}
+var DRAFT_FIELDS = ["subject", "customHtml", "isPublished"];
+async function isSameDraft(deps, found, wanted) {
+  let fields = found.fields;
+  const listed = fields;
+  if ((listed === null || DRAFT_FIELDS.some((key) => listed[key] === void 0)) && found.id !== null) {
+    const body = await send(deps, `/emails/${encodeURIComponent(found.id)}`, { method: "GET" });
+    const email3 = isRecord5(body) ? body["email"] : void 0;
+    fields = isRecord5(email3) ? email3 : null;
+  }
+  if (fields === null) return false;
+  return fields["subject"] === wanted.subject && fields["customHtml"] === wanted.html && fields["isPublished"] === false;
 }
 async function readMauticState(deps, draft2) {
   switch (draft2.kind) {
@@ -22726,6 +22739,12 @@ async function applyLive(deps, action) {
       const { name, subject, html } = draftParams(action);
       const found = await findEmailByName(deps, name);
       if (found.exists) {
+        if (!await isSameDraft(deps, found, { subject, html })) {
+          throw new AutopilotError(
+            "invalid_input",
+            `An email named "${name.trim()}" already exists with different content or is published; the draft needs another name.`
+          );
+        }
         const result = { ok: true, dryRun: false, after: { exists: true } };
         if (found.id !== null) result.resource = found.id;
         return result;
@@ -22965,6 +22984,7 @@ async function fetchMetaAdsSnapshot(deps, request) {
       if (id !== void 0) listed.add(id);
     }
     const unlistedIds = [...byId.keys()].filter((id) => !listed.has(id));
+    const unlistedStatus = entities.truncated ? null : "REMOVED";
     const build2 = (conversionAction2) => {
       const rows2 = [];
       for (const entity2 of entities.rows) {
@@ -22981,7 +23001,7 @@ async function fetchMetaAdsSnapshot(deps, request) {
         const row = {
           id,
           metrics: insightMetrics(insight, conversionAction2),
-          attrs: { status: "REMOVED", ...deliveryAttrs(insight) }
+          attrs: { status: unlistedStatus, ...deliveryAttrs(insight) }
         };
         const name = text4(insight[nameField]);
         if (name !== void 0) row.name = name;
@@ -22997,7 +23017,13 @@ async function fetchMetaAdsSnapshot(deps, request) {
       }
       return rows2;
     };
-    return { insights: stats.rows, build: build2, truncated: entities.truncated || stats.truncated, unlisted: unlistedIds.length };
+    return {
+      insights: stats.rows,
+      build: build2,
+      truncated: entities.truncated || stats.truncated,
+      unlisted: unlistedIds.length,
+      listComplete: !entities.truncated
+    };
   };
   const base = (entity2, id) => {
     const row = { id, metrics: {}, attrs: {} };
@@ -23081,7 +23107,7 @@ async function fetchMetaAdsSnapshot(deps, request) {
         }
         return rows2;
       };
-      return { insights: stats.rows, build: build2, truncated: stats.truncated, unlisted: 0 };
+      return { insights: stats.rows, build: build2, truncated: stats.truncated, unlisted: 0, listComplete: true };
     },
     daily: async () => {
       const stats = await insights("account", "", { time_increment: 1 });
@@ -23095,7 +23121,7 @@ async function fetchMetaAdsSnapshot(deps, request) {
         rows2.sort((a, b) => a.id.localeCompare(b.id));
         return rows2;
       };
-      return { insights: stats.rows, build: build2, truncated: stats.truncated, unlisted: 0 };
+      return { insights: stats.rows, build: build2, truncated: stats.truncated, unlisted: 0, listComplete: true };
     }
   };
   const wanted = SUPPORTED.filter((name) => request.datasets === void 0 || request.datasets.includes(name));
@@ -23137,8 +23163,9 @@ async function fetchMetaAdsSnapshot(deps, request) {
       warnings.push(`${name}: ${note}`);
     }
     if (loaded.unlisted > 0) {
+      const subject = `${loaded.unlisted} ${loaded.unlisted === 1 ? "row comes from an entity" : "rows come from entities"}`;
       notes.push(
-        `${loaded.unlisted} ${loaded.unlisted === 1 ? "row comes from an entity" : "rows come from entities"} no longer listed (archived or deleted).`
+        loaded.listComplete ? `${subject} no longer listed (archived or deleted).` : `${subject} not in the listed pages; ${loaded.unlisted === 1 ? "its" : "their"} status is unknown.`
       );
     }
     if (notes.length > 0) {
@@ -42373,22 +42400,30 @@ function inert(text5, max) {
 function accountText(text5, max = MAX_ACCOUNT_TEXT) {
   return `"${inert(text5, max)}"`;
 }
-function literalJson(value) {
-  return canonicalJson(value).replace(
-    /[\p{Cf}\u2028\u2029]/gu,
-    (char) => `\\u${(char.codePointAt(0) ?? 0).toString(16).padStart(4, "0")}`
-  );
+function visible(text5, pattern) {
+  return text5.replace(pattern, (char) => `\\u${(char.codePointAt(0) ?? 0).toString(16).padStart(4, "0")}`);
 }
-var HTML_EXCERPT_CHARS = 200;
-function paramLines(action) {
+function literalJson(value) {
+  return visible(canonicalJson(value), /[\p{Cf}\u2028\u2029]/gu);
+}
+var HTML_FULL_CHARS = 8e3;
+var HTML_EXCERPT_CHARS = 2e3;
+function dataBlock(text5) {
+  return text5.split("\n").map((line) => `    ${visible(line, /[\p{Cc}\p{Cf}\u2028\u2029]/gu)}`);
+}
+function paramLines(action, index, planId) {
   const html = action.params["html"];
   if (action.kind !== "mautic.email.create_draft" || typeof html !== "string") {
     return [`   params: ${literalJson(action.params)}`];
   }
   const rest = Object.fromEntries(Object.entries(action.params).filter(([key]) => key !== "html"));
+  const params = `   params: ${literalJson(rest)}`;
+  if (html.length <= HTML_FULL_CHARS) return [params, "   html:", ...dataBlock(html)];
   return [
-    `   params: ${literalJson(rest)}`,
-    `   html: ${html.length} characters, sha256 ${sha256(html)}, begins ${accountText(html, HTML_EXCERPT_CHARS)}`
+    params,
+    `   html: ${html.length} characters, sha256 ${sha256(html)}, first ${HTML_EXCERPT_CHARS} characters:`,
+    ...dataBlock(html.slice(0, HTML_EXCERPT_CHARS)),
+    `   The full HTML is not shown here. Read it before approving: autopilot-marketing preview ${planId} --json (actions[${index}].params.html).`
   ];
 }
 function percent(fraction2, decimals) {
@@ -42520,7 +42555,7 @@ function renderPlanPreview(preview2, currency = "XXX") {
       "",
       `${index + 1}. ${action.kind} [${action.id}]`,
       `   entity: ${entityText(action.target)}`,
-      ...paramLines(action),
+      ...paramLines(action, index, plan2.id),
       ...caution === void 0 ? [] : [`   caution: ${caution}`],
       `   before: ${action.before === null ? "unknown (could not be read)" : literalJson(action.before)}`,
       `   after: ${literalJson(action.after)}`,
@@ -42944,7 +42979,8 @@ var TARGET_DATASETS = {
   campaign: "campaigns",
   ad_group: "ad_groups",
   ad: "ads",
-  keyword: "keywords"
+  keyword: "keywords",
+  segment: "segments"
 };
 var CHILD_FIELDS = ["exists", "member"];
 function isRecord9(value) {
@@ -42960,15 +42996,16 @@ function monthlyImpact(finding) {
 function draftKey(draft2) {
   return canonicalJson([draft2.kind, draft2.target.level, draft2.target.id, draft2.params]);
 }
-function snapshotTarget(target, snapshot2) {
+function snapshotTarget(target, snapshot2, knownTargets) {
   const dataset = TARGET_DATASETS[target.level];
   const row = dataset === void 0 ? void 0 : snapshot2?.datasets?.[dataset]?.find((item) => item.id === target.id);
+  const source = row ?? knownTargets.find((item) => item.level === target.level && item.id === target.id);
   return {
     level: target.level,
     id: target.id,
-    ...row?.name === void 0 ? {} : { name: row.name },
-    ...row?.campaignId === void 0 ? {} : { campaignId: row.campaignId },
-    ...row?.adGroupId === void 0 ? {} : { adGroupId: row.adGroupId }
+    ...typeof source?.name !== "string" ? {} : { name: source.name },
+    ...typeof source?.campaignId !== "string" ? {} : { campaignId: source.campaignId },
+    ...typeof source?.adGroupId !== "string" ? {} : { adGroupId: source.adGroupId }
   };
 }
 function draftsFromFindings(findings, maxActions = DEFAULT_MAX_ACTIONS) {
@@ -43055,9 +43092,10 @@ ${problems.join("\n")}`, {
       hint: "Fix every listed problem and create the plan again."
     });
   }
+  const knownTargets = Array.isArray(input2.knownTargets) ? input2.knownTargets : [];
   const actions = [];
   for (const draft2 of input2.drafts) {
-    const normalized = { ...draft2, target: snapshotTarget(draft2.target, input2.snapshot) };
+    const normalized = { ...draft2, target: snapshotTarget(draft2.target, input2.snapshot, knownTargets) };
     const before = await input2.connector.readState(normalized);
     actions.push(buildAction(normalized, before));
   }
@@ -43235,12 +43273,11 @@ function evaluatePolicy(input2) {
   rule("protected_entity", (deny) => {
     const protectedEntities = account.protected ?? [];
     if (protectedEntities.length === 0) return;
-    const needsName = protectedEntities.some((pattern) => pattern.includes("*"));
     for (const action of plan2.actions) {
       const { target } = action;
       const needsCampaign = target.level === "ad_group" || target.level === "ad" || target.level === "keyword";
-      if (needsName && !target.name || needsCampaign && !target.campaignId) {
-        deny("The target could not be checked against the protected list; the plan must be created from a fresh snapshot.", {
+      if (!target.name || needsCampaign && !target.campaignId) {
+        deny("The target could not be checked against the protected list; create the plan from a fresh snapshot.", {
           actionId: action.id,
           observed: target.id
         });
@@ -43299,6 +43336,12 @@ function evaluatePolicy(input2) {
     if (snapshot2 === null) return;
     if (snapshot2.accountId !== plan2.accountId || snapshot2.platform !== plan2.platform) {
       deny("The snapshot account and platform must match the plan.");
+    }
+    if (snapshot2.externalAccountId !== account.externalId) {
+      deny("The snapshot was read from a different platform account than the one configured; create a fresh snapshot.", {
+        observed: snapshot2.externalAccountId,
+        limit: account.externalId
+      });
     }
     if (snapshot2.source !== "api" && account.source !== "demo") {
       deny("Live changes need a snapshot read from the platform API; a CSV import can be audited but cannot back a change.");
@@ -43934,7 +43977,8 @@ async function createRevertPlan(planId, runtime) {
     createdBy: "agent",
     connector,
     now: runtime.now(),
-    revertsPlanId: plan2.id
+    revertsPlanId: plan2.id,
+    knownTargets: plan2.actions.map((action) => action.target)
   });
   for (const [index, action] of newPlan.actions.entries()) {
     const original = verified[index];

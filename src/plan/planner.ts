@@ -14,6 +14,7 @@ const TARGET_DATASETS: Partial<Record<EntityLevel, DatasetName>> = {
   ad_group: 'ad_groups',
   ad: 'ads',
   keyword: 'keywords',
+  segment: 'segments',
 };
 
 /**
@@ -40,16 +41,20 @@ function draftKey(draft: ActionDraft): string {
   return canonicalJson([draft.kind, draft.target.level, draft.target.id, draft.params]);
 }
 
-/** Target names and ancestry come only from the referenced snapshot. */
-function snapshotTarget(target: EntityRef, snapshot: Snapshot | null): EntityRef {
+/**
+ * Target names and ancestry come from the referenced snapshot row, or, when there is no such row,
+ * from a known target of the same level and id. The draft's own metadata is never used.
+ */
+function snapshotTarget(target: EntityRef, snapshot: Snapshot | null, knownTargets: EntityRef[]): EntityRef {
   const dataset = TARGET_DATASETS[target.level];
   const row = dataset === undefined ? undefined : snapshot?.datasets?.[dataset]?.find((item) => item.id === target.id);
+  const source = row ?? knownTargets.find((item) => item.level === target.level && item.id === target.id);
   return {
     level: target.level,
     id: target.id,
-    ...(row?.name === undefined ? {} : { name: row.name }),
-    ...(row?.campaignId === undefined ? {} : { campaignId: row.campaignId }),
-    ...(row?.adGroupId === undefined ? {} : { adGroupId: row.adGroupId }),
+    ...(typeof source?.name !== 'string' ? {} : { name: source.name }),
+    ...(typeof source?.campaignId !== 'string' ? {} : { campaignId: source.campaignId }),
+    ...(typeof source?.adGroupId !== 'string' ? {} : { adGroupId: source.adGroupId }),
   };
 }
 
@@ -161,6 +166,8 @@ export async function createPlan(input: {
   connector: Connector;
   now: Date;
   revertsPlanId?: string;
+  /** Targets whose metadata an earlier plan resolved from a snapshot; used only without a snapshot row. */
+  knownTargets?: EntityRef[];
 }): Promise<Plan> {
   const problems = collectProblems(input);
   if (problems.length > 0) {
@@ -169,9 +176,10 @@ export async function createPlan(input: {
     });
   }
 
+  const knownTargets = Array.isArray(input.knownTargets) ? input.knownTargets : [];
   const actions: Action[] = [];
   for (const draft of input.drafts) {
-    const normalized = { ...draft, target: snapshotTarget(draft.target, input.snapshot) };
+    const normalized = { ...draft, target: snapshotTarget(draft.target, input.snapshot, knownTargets) };
     const before = await input.connector.readState(normalized);
     actions.push(buildAction(normalized, before));
   }

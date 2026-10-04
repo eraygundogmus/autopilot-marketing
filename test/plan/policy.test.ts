@@ -319,11 +319,51 @@ describe('evaluatePolicy', () => {
     check(decision, 'protected_entity', 'deny');
   });
 
-  it('requires metadata only when the protected list needs it', () => {
-    const unnamed = plan([action({ target: { level: 'campaign', id: 'campaign-1' } })]);
-    check(evaluatePolicy(input({
-      account: account({ protected: ['another-campaign'] }), plan: unnamed,
-    })), 'protected_entity', 'pass');
+  it.each(['Brand Search', 'another-campaign'])(
+    'denies a nameless target when the protected list holds the exact entry %s',
+    (pattern) => {
+      const decision = evaluatePolicy(input({
+        account: account({ protected: [pattern] }),
+        plan: plan([action({ target: { level: 'campaign', id: 'campaign-1' } })]),
+      }));
+      check(decision, 'protected_entity', 'deny');
+      expect(decision.allowed).toBe(false);
+      expect(decision.results).toContainEqual(expect.objectContaining({
+        ruleId: 'protected_entity', actionId: 'act_current',
+        message: expect.stringMatching(/could not be checked against the protected list; create the plan from a fresh snapshot/i),
+      }));
+    },
+  );
+
+  it('matches an exact protected name case-insensitively and never as a substring', () => {
+    const named = (name: string): PolicyDecision => evaluatePolicy(input({
+      account: account({ protected: ['Brand Search'] }),
+      plan: plan([action({ target: { level: 'campaign', id: 'campaign-1', name } })]),
+    }));
+    const decision = named('bRAND sEARCH');
+    check(decision, 'protected_entity', 'deny');
+    expect(decision.results).toContainEqual(expect.objectContaining({
+      ruleId: 'protected_entity', message: 'The action targets a protected entity.',
+    }));
+    check(named('Brand Search US'), 'protected_entity', 'pass');
+  });
+
+  it('denies a snapshot read from a different external account under the same local account id', () => {
+    for (const source of ['api', 'demo'] as const) {
+      const decision = evaluatePolicy(input({
+        account: account({ source, externalId: '456' }),
+        snapshot: snapshot(10_000, { source }),
+        plan: plan([budget(100, 115)]),
+      }));
+      check(decision, 'snapshot_source', 'deny');
+      expect(decision.allowed).toBe(false);
+      expect(decision.results).toContainEqual(expect.objectContaining({
+        ruleId: 'snapshot_source', observed: '123', limit: '456',
+      }));
+    }
+  });
+
+  it('requires ancestry only when there is a protected list', () => {
     const child = plan([action({ target: { level: 'ad', id: 'ad-1' } })]);
     for (const config of [account(), account({ protected: [] })]) {
       check(evaluatePolicy(input({ account: config, plan: child })), 'protected_entity', 'pass');

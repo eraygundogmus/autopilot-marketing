@@ -272,6 +272,45 @@ describe('fetchMetaAdsSnapshot', () => {
     expect(fields).toContain('campaign_name');
   });
 
+  it('leaves the status of an unmatched Insights row unknown when the entity list was cut off', async () => {
+    const insights = [
+      { campaign_id: 'c1', campaign_name: 'Listed', spend: '10' },
+      { campaign_id: 'c500', campaign_name: 'On a later page', spend: '40' },
+      { campaign_id: 'c501', campaign_name: 'Also later', spend: '5' },
+    ];
+    let page = 0;
+    const cut = fakeHttp({
+      campaignInsights: insights,
+      override: (request) => {
+        if (!new URL(request.url).pathname.endsWith('/campaigns')) return undefined;
+        page += 1;
+        return { data: [{ id: `c${page}`, status: 'ACTIVE' }], paging: { next: `${BASE}/campaigns?after=${page}` } };
+      },
+    });
+    const deps = makeDeps(cut.http);
+    const snapshot = await fetchMetaAdsSnapshot(deps, { account: deps.account, dateRange: RANGE, datasets: ['campaigns'] });
+    const rows = snapshot.datasets.campaigns ?? [];
+    const later = rows.find((row) => row.id === 'c500');
+    expect(later).toMatchObject({ name: 'On a later page' });
+    expect(later?.attrs['status']).toBeNull();
+    expect(later?.metrics.cost).toBe(40);
+    expect(rows.find((row) => row.id === 'c1')?.attrs['status']).toBe('ENABLED');
+    expect(snapshot.coverage.campaigns?.status).toBe('partial');
+    const note = snapshot.coverage.campaigns?.note ?? '';
+    expect(note).toContain('2 rows come from entities not in the listed pages; their status is unknown');
+    expect(note).not.toContain('archived');
+
+    const whole = fakeHttp({ campaigns: [{ id: 'c1', status: 'ACTIVE' }], campaignInsights: insights });
+    const wholeDeps = makeDeps(whole.http);
+    const complete = await fetchMetaAdsSnapshot(wholeDeps, {
+      account: wholeDeps.account,
+      dateRange: RANGE,
+      datasets: ['campaigns'],
+    });
+    expect(complete.datasets.campaigns?.find((row) => row.id === 'c500')?.attrs['status']).toBe('REMOVED');
+    expect(complete.coverage.campaigns?.note).toContain('2 rows come from entities no longer listed (archived or deleted)');
+  });
+
   it('uses one conversion action for the whole snapshot', async () => {
     const fixture: Fixture = {
       campaigns: [

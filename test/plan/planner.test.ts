@@ -326,6 +326,50 @@ describe('createPlan', () => {
     expect(plan.actions[0]?.target).toEqual({ level: 'campaign', id: 'c1', name: 'Protected Brand' });
   });
 
+  it('takes a segment name from the segments dataset', async () => {
+    const mautic: AccountConfig = { id: 'acme-mautic', platform: 'mautic', externalId: 'm1' };
+    const draft: ActionDraft = {
+      kind: 'mautic.segment.add_contact',
+      target: { level: 'segment', id: 'segment-1', name: 'Forged name' },
+      params: { contactId: '123' },
+      rationale: 'Add the reviewed contact',
+    };
+    const data = {
+      ...snapshot({ segments: [{ id: 'segment-1', name: 'Newsletter', metrics: {}, attrs: {} }] }),
+      platform: mautic.platform,
+      accountId: mautic.id,
+    };
+    const plan = await createPlan({ ...base([draft]), account: mautic, snapshot: data });
+    expect(plan.actions[0]?.target).toEqual({ level: 'segment', id: 'segment-1', name: 'Newsletter' });
+  });
+
+  it('fills target metadata from a known target only when the snapshot has no row', async () => {
+    const forged = { name: 'Safe name', campaignId: 'forged-parent', adGroupId: 'forged-group' };
+    const drafts = [
+      pause('ad-1', { kind: 'google_ads.ad.pause', target: { level: 'ad', id: 'ad-1', ...forged } }),
+      pause('ad-2', { kind: 'google_ads.ad.pause', target: { level: 'ad', id: 'ad-2', ...forged } }),
+      pause('ad-3', { kind: 'google_ads.ad.pause', target: { level: 'ad', id: 'ad-3', ...forged } }),
+    ];
+    const knownTargets: EntityRef[] = [
+      { level: 'ad', id: 'ad-1', name: 'Known ad', campaignId: 'c1', adGroupId: 'g1' },
+      { level: 'ad', id: 'ad-2', name: 'Stale ad', campaignId: 'c-old', adGroupId: 'g-old' },
+      { level: 'campaign', id: 'ad-3', name: 'Another level' },
+    ];
+    const data = snapshot({ ads: [{ id: 'ad-2', name: 'Brand ad', campaignId: 'c2', metrics: {}, attrs: {} }] });
+    const withSnapshot = await createPlan({ ...base(drafts), snapshot: data, knownTargets });
+    expect(withSnapshot.actions.map((item) => item.target)).toEqual([
+      { level: 'ad', id: 'ad-1', name: 'Known ad', campaignId: 'c1', adGroupId: 'g1' },
+      { level: 'ad', id: 'ad-2', name: 'Brand ad', campaignId: 'c2' },
+      { level: 'ad', id: 'ad-3' },
+    ]);
+    const withoutSnapshot = await createPlan({ ...base(drafts), knownTargets });
+    expect(withoutSnapshot.actions.map((item) => item.target)).toEqual([
+      knownTargets[0],
+      knownTargets[1],
+      { level: 'ad', id: 'ad-3' },
+    ]);
+  });
+
   it('lets a connector error propagate', async () => {
     const failure = new AutopilotError('not_found', 'Campaign c2 does not exist');
     const { connector, reads } = fakeConnector({ c1: { status: 'ENABLED', dailyBudget: 40 }, c2: failure });
