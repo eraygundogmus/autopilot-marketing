@@ -682,7 +682,11 @@ export interface Action extends ActionDraft {
   /** sha256 of canonical `before`; live apply aborts the action when a fresh read differs. */
   preconditionHash: string | null;
   spendEffect: SpendEffect;
-  /** Change to daily spend ceiling, account currency; null when unknown. */
+  /**
+   * Change to the daily spend ceiling (the budgets), account currency; null when unknown. 0 for a
+   * change that moves spend inside an unchanged budget: a bid, a keyword, an ad, a negative keyword.
+   * `spendEffect` still says which way actual spend is expected to move.
+   */
   spendDeltaPerDay: number | null;
   reversible: Reversibility;
   status: ActionStatus;

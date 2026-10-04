@@ -348,6 +348,29 @@ describe('evaluatePolicy', () => {
     check(named('Brand Search US'), 'protected_entity', 'pass');
   });
 
+  it('matches an account-level target by id only, while a nameless campaign stays denied', () => {
+    const draft = (id: string): Action => action({
+      kind: 'mautic.email.create_draft',
+      platform: 'mautic',
+      target: { level: 'account', id },
+      before: {},
+      after: { subject: 'Hello' },
+      spendEffect: 'none',
+      spendDeltaPerDay: 0,
+    });
+    const evaluate = (item: Action): PolicyDecision => evaluatePolicy(input({
+      account: account({ protected: ['99'] }),
+      plan: plan([item]),
+    }));
+    check(evaluate(draft('account-1')), 'protected_entity', 'pass');
+    check(evaluate(action({ target: { level: 'campaign', id: 'campaign-1' } })), 'protected_entity', 'deny');
+    const decision = evaluate(draft('99'));
+    check(decision, 'protected_entity', 'deny');
+    expect(decision.results).toContainEqual(expect.objectContaining({
+      ruleId: 'protected_entity', actionId: 'act_current', message: 'The action targets a protected entity.',
+    }));
+  });
+
   it('denies a snapshot read from a different external account under the same local account id', () => {
     for (const source of ['api', 'demo'] as const) {
       const decision = evaluatePolicy(input({

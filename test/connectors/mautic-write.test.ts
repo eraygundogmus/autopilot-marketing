@@ -108,13 +108,60 @@ describe('readMauticState', () => {
   });
 
   it('looks an email up by encoded name', async () => {
-    const { deps, calls } = makeDeps(() => ({ total: '1', emails: [{ id: 5, name: ' Welcome "A" ' }] }));
+    const { deps, calls } = makeDeps(() => ({
+      total: '1',
+      emails: [existing({ id: 5, name: ' Welcome "A" ' })],
+    }));
     await expect(readMauticState(deps, emailDraft())).resolves.toEqual({ exists: true });
     expect(calls[0]?.url).toBe(
       `https://m.example/api/emails?search=${encodeURIComponent('name:"Welcome "A""')}&limit=100&start=0`,
     );
     const empty = makeDeps(() => ({ total: 0, emails: [] }));
     await expect(readMauticState(empty.deps, emailDraft())).resolves.toEqual({ exists: false });
+  });
+
+  it('reports exists only for the identical unpublished draft', async () => {
+    const state = (email: JsonObject): Promise<JsonObject> =>
+      readMauticState(makeDeps(() => ({ total: 1, emails: [email] })).deps, emailDraft());
+    await expect(state(existing())).resolves.toEqual({ exists: true });
+    await expect(state(existing({ subject: 'Other' }))).resolves.toEqual({ exists: false });
+    await expect(state(existing({ customHtml: '<p>Other</p>' }))).resolves.toEqual({ exists: false });
+    await expect(state(existing({ isPublished: true }))).resolves.toEqual({ exists: false });
+  });
+
+  it('compares against the email detail when the list entry lacks the fields', async () => {
+    const state = (email: JsonObject): Promise<JsonObject> =>
+      readMauticState(
+        makeDeps((request) =>
+          request.url.endsWith('/emails/12') ? { email } : { total: 1, emails: [{ id: 12, name: 'Welcome "A"' }] },
+        ).deps,
+        emailDraft(),
+      );
+    await expect(state(existing())).resolves.toEqual({ exists: true });
+    await expect(state(existing({ isPublished: true }))).resolves.toEqual({ exists: false });
+    await expect(state(existing({ subject: 'Other' }))).resolves.toEqual({ exists: false });
+  });
+
+  it('rejects instead of guessing when the email detail cannot be read', async () => {
+    const failing = makeDeps((request) => {
+      if (request.url.endsWith('/emails/12')) {
+        throw new AutopilotError('platform_error', 'GET https://m.example/api/emails/12 -> 503: down', {
+          retryable: true,
+        });
+      }
+      return { total: 1, emails: [{ id: 12, name: 'Welcome "A"' }] };
+    });
+    await expect(readMauticState(failing.deps, emailDraft())).rejects.toMatchObject({
+      code: 'platform_error',
+      message: expect.stringContaining('503'),
+    });
+    const malformed = makeDeps((request) =>
+      request.url.endsWith('/emails/12') ? {} : { total: 1, emails: [{ id: 12, name: 'Welcome "A"' }] },
+    );
+    await expect(readMauticState(malformed.deps, emailDraft())).rejects.toMatchObject({ code: 'platform_error' });
+    const noId = makeDeps(() => ({ total: 1, emails: [{ name: 'Welcome "A"' }] }));
+    await expect(readMauticState(noId.deps, emailDraft())).rejects.toMatchObject({ code: 'platform_error' });
+    expect(noId.calls).toHaveLength(1);
   });
 });
 
@@ -160,8 +207,9 @@ describe('applyMauticAction', () => {
   it('refuses a same-named email with a different subject or body', async () => {
     for (const change of [{ subject: 'Other' }, { customHtml: '<p>Other</p>' }]) {
       const { deps, calls } = makeDeps(() => ({ total: 1, emails: [existing(change)] }));
-      await expect(readMauticState(deps, emailDraft())).resolves.toEqual({ exists: true });
+      await expect(readMauticState(deps, emailDraft())).resolves.toEqual({ exists: false });
       const result = await applyMauticAction(deps, toAction(emailDraft()), live);
+      expect(posts(calls)).toHaveLength(0);
       expect(result).toEqual({
         ok: false,
         dryRun: false,

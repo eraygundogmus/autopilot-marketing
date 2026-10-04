@@ -198,7 +198,14 @@ export function evaluatePolicy(input: PolicyInput): PolicyDecision {
     for (const action of plan.actions) {
       const { target } = action;
       const needsCampaign = target.level === 'ad_group' || target.level === 'ad' || target.level === 'keyword';
-      // Any entry may be a name, exact or glob, so a target without a name cannot be cleared.
+      // An account target carries no entity name by construction, so only its id can be protected.
+      if (target.level === 'account') {
+        if (protectedEntities.includes(target.id)) {
+          deny('The action targets a protected entity.', { actionId: action.id, observed: target.id });
+        }
+        continue;
+      }
+      // Any entry may be a name, exact or glob, so a snapshot entity without a name cannot be cleared.
       if (!target.name || (needsCampaign && !target.campaignId)) {
         deny('The target could not be checked against the protected list; create the plan from a fresh snapshot.', {
           actionId: action.id, observed: target.id,

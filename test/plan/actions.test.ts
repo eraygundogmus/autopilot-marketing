@@ -164,11 +164,32 @@ describe('spend', () => {
     expect(spec.spend({ dailyBudget: null }, { dailyBudget: 10 })).toEqual({ effect: 'unknown', deltaPerDay: null });
   });
 
+  it('entities without a budget of their own leave the daily ceiling unchanged', () => {
+    for (const kind of ['google_ads.ad_group.enable', 'google_ads.ad.enable', 'google_ads.keyword.enable', 'meta_ads.ad.enable'] as const) {
+      expect(actionSpec(kind).spend({ status: 'PAUSED' }, { status: 'ENABLED' })).toEqual({ effect: 'increase', deltaPerDay: 0 });
+    }
+    expect(actionSpec('google_ads.keyword.pause').spend({ status: 'ENABLED' }, { status: 'PAUSED' })).toEqual({
+      effect: 'decrease',
+      deltaPerDay: 0,
+    });
+    // A null budget means it is set one level up, shared or lifetime: enabling moves no ceiling.
+    expect(actionSpec('meta_ads.adset.enable').spend({ status: 'PAUSED', dailyBudget: null }, { status: 'ENABLED' })).toEqual({
+      effect: 'increase',
+      deltaPerDay: 0,
+    });
+    // A budget that could not be read at all stays unknown.
+    expect(actionSpec('meta_ads.adset.enable').spend({ status: 'PAUSED' }, { status: 'ENABLED' })).toEqual({
+      effect: 'increase',
+      deltaPerDay: null,
+    });
+  });
+
   it('bid direction without a daily amount', () => {
     const spec = actionSpec('google_ads.keyword.set_bid');
-    expect(spec.spend({ bid: 1 }, { bid: 2 })).toEqual({ effect: 'increase', deltaPerDay: null });
-    expect(spec.spend({ bid: 2 }, { bid: 1 })).toEqual({ effect: 'decrease', deltaPerDay: null });
-    expect(spec.spend({ bid: 2 }, { bid: 2 })).toEqual({ effect: 'none', deltaPerDay: null });
+    // A bid moves spend inside the daily budget; the budget ceiling itself does not change.
+    expect(spec.spend({ bid: 1 }, { bid: 2 })).toEqual({ effect: 'increase', deltaPerDay: 0 });
+    expect(spec.spend({ bid: 2 }, { bid: 1 })).toEqual({ effect: 'decrease', deltaPerDay: 0 });
+    expect(spec.spend({ bid: 2 }, { bid: 2 })).toEqual({ effect: 'none', deltaPerDay: 0 });
     expect(spec.spend(null, { bid: 2 })).toEqual({ effect: 'unknown', deltaPerDay: null });
     expect(spec.spend({}, { bid: 2 })).toEqual({ effect: 'unknown', deltaPerDay: null });
   });
@@ -176,10 +197,10 @@ describe('spend', () => {
   it('negative keywords and mautic', () => {
     const add = actionSpec('google_ads.negative_keyword.add');
     const remove = actionSpec('google_ads.negative_keyword.remove');
-    expect(add.spend({ exists: false }, { exists: true })).toEqual({ effect: 'decrease', deltaPerDay: null });
-    expect(add.spend(null, { exists: true })).toEqual({ effect: 'decrease', deltaPerDay: null });
+    expect(add.spend({ exists: false }, { exists: true })).toEqual({ effect: 'decrease', deltaPerDay: 0 });
+    expect(add.spend(null, { exists: true })).toEqual({ effect: 'decrease', deltaPerDay: 0 });
     expect(add.spend({ exists: true }, { exists: true })).toEqual({ effect: 'none', deltaPerDay: 0 });
-    expect(remove.spend({ exists: true }, { exists: false })).toEqual({ effect: 'increase', deltaPerDay: null });
+    expect(remove.spend({ exists: true }, { exists: false })).toEqual({ effect: 'increase', deltaPerDay: 0 });
     expect(remove.spend({ exists: false }, { exists: false })).toEqual({ effect: 'none', deltaPerDay: 0 });
     expect(actionSpec('mautic.segment.add_contact').spend(null, { member: true })).toEqual({
       effect: 'none',

@@ -37,36 +37,34 @@ function literalJson(value: unknown): string {
   return visible(canonicalJson(value), /[\p{Cf}\u2028\u2029]/gu);
 }
 
-const HTML_FULL_CHARS = 8000;
-const HTML_EXCERPT_CHARS = 2000;
+const MIN_FENCE = 4;
 
 /**
- * Agent-written text as an indented block: every line starts with four spaces, so no line of it can
- * pass for a line of the review, and every control or format character other than the newline is a
- * visible escape.
+ * Agent-written text as a fenced code block that starts in the first column: the fence of tildes is
+ * longer than every run of tildes in the text, so no line of the text can close it, and inside it no
+ * line is read as Markdown. Every control or format character other than the newline is a visible
+ * escape.
  */
-function dataBlock(text: string): string[] {
-  return text.split('\n').map((line) => `    ${visible(line, /[\p{Cc}\p{Cf}\u2028\u2029]/gu)}`);
+function fencedBlock(text: string): string[] {
+  const longest = (text.match(/~+/g) ?? []).reduce((max, run) => Math.max(max, run.length), 0);
+  const fence = '~'.repeat(Math.max(MIN_FENCE, longest + 1));
+  return [fence, ...text.split('\n').map((line) => visible(line, /[\p{Cc}\p{Cf}\u2028\u2029]/gu)), fence];
 }
 
 /**
- * What the action does, complete: every parameter as canonical JSON. An email body is printed whole
- * as a data block up to HTML_FULL_CHARS; a longer one is identified by its length and sha256, shown
- * by its first characters, and the reader is told where to read all of it.
+ * What the action does, complete: every parameter as canonical JSON. An email body is identified by
+ * its length and sha256 and printed whole, whatever its length, as a fenced block.
  */
-function paramLines(action: Action, index: number, planId: string): string[] {
+function paramLines(action: Action): string[] {
   const html = action.params['html'];
   if (action.kind !== 'mautic.email.create_draft' || typeof html !== 'string') {
     return [`   params: ${literalJson(action.params)}`];
   }
   const rest = Object.fromEntries(Object.entries(action.params).filter(([key]) => key !== 'html'));
-  const params = `   params: ${literalJson(rest)}`;
-  if (html.length <= HTML_FULL_CHARS) return [params, '   html:', ...dataBlock(html)];
   return [
-    params,
-    `   html: ${html.length} characters, sha256 ${sha256(html)}, first ${HTML_EXCERPT_CHARS} characters:`,
-    ...dataBlock(html.slice(0, HTML_EXCERPT_CHARS)),
-    `   The full HTML is not shown here. Read it before approving: autopilot-marketing preview ${planId} --json (actions[${index}].params.html).`,
+    `   params: ${literalJson(rest)}`,
+    `   html: ${html.length} characters, sha256 ${sha256(html)}`,
+    ...fencedBlock(html),
   ];
 }
 
@@ -228,7 +226,7 @@ export function renderPlanPreview(
       '',
       `${index + 1}. ${action.kind} [${action.id}]`,
       `   entity: ${entityText(action.target)}`,
-      ...paramLines(action, index, plan.id),
+      ...paramLines(action),
       ...(caution === undefined ? [] : [`   caution: ${caution}`]),
       `   before: ${action.before === null ? 'unknown (could not be read)' : literalJson(action.before)}`,
       `   after: ${literalJson(action.after)}`,

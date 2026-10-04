@@ -20332,8 +20332,8 @@ function statusSpec(targetLevel, hasBudget, status, opposite) {
     after: () => ({ status }),
     spend: (before) => {
       if (before !== null && before["status"] === status) return { effect: "none", deltaPerDay: 0 };
-      const budget = before === null ? void 0 : before["dailyBudget"];
-      const amount = isFiniteNumber(budget) ? budget : null;
+      const budget = !hasBudget || before === null ? void 0 : before["dailyBudget"];
+      const amount = !hasBudget || budget === null ? 0 : isFiniteNumber(budget) ? budget : null;
       if (status === "PAUSED") return { effect: "decrease", deltaPerDay: amount === null ? null : 0 - amount };
       return { effect: "increase", deltaPerDay: amount };
     },
@@ -20361,7 +20361,7 @@ function numericSpec(targetLevel, field2, kind) {
       const to = after[field2];
       if (!isFiniteNumber(from) || !isFiniteNumber(to)) return { effect: "unknown", deltaPerDay: null };
       const delta = Math.round((to - from) * 1e6) / 1e6;
-      return { effect: direction(delta), deltaPerDay: field2 === "bid" ? null : delta === 0 ? 0 : delta };
+      return { effect: direction(delta), deltaPerDay: field2 === "bid" || delta === 0 ? 0 : delta };
     },
     inverse: (action) => {
       const previous = action.before === null ? void 0 : action.before[field2];
@@ -20401,7 +20401,7 @@ function negativeKeywordSpec(exists, opposite) {
     after: () => ({ exists }),
     spend: (before) => {
       if (before !== null && before["exists"] === exists) return { effect: "none", deltaPerDay: 0 };
-      return { effect: exists ? "decrease" : "increase", deltaPerDay: null };
+      return { effect: exists ? "decrease" : "increase", deltaPerDay: 0 };
     },
     inverse: (action) => toggleInverse(action, "exists", exists, opposite)
   };
@@ -22699,15 +22699,21 @@ async function findEmailByName(deps, name) {
   );
 }
 var DRAFT_FIELDS = ["subject", "customHtml", "isPublished"];
-async function isSameDraft(deps, found, wanted) {
-  let fields = found.fields;
-  const listed = fields;
-  if ((listed === null || DRAFT_FIELDS.some((key) => listed[key] === void 0)) && found.id !== null) {
-    const body = await send(deps, `/emails/${encodeURIComponent(found.id)}`, { method: "GET" });
-    const email3 = isRecord5(body) ? body["email"] : void 0;
-    fields = isRecord5(email3) ? email3 : null;
+async function draftFields(deps, found) {
+  const listed = found.fields;
+  if (listed !== null && DRAFT_FIELDS.every((key) => listed[key] !== void 0)) return listed;
+  if (found.id === null) {
+    throw new AutopilotError("platform_error", "Mautic listed an email without an id; its content cannot be read.");
   }
-  if (fields === null) return false;
+  const body = await send(deps, `/emails/${encodeURIComponent(found.id)}`, { method: "GET" });
+  const email3 = isRecord5(body) ? body["email"] : void 0;
+  if (!isRecord5(email3)) {
+    throw new AutopilotError("platform_error", `Mautic did not return the content of email ${found.id}.`);
+  }
+  return email3;
+}
+async function isSameDraft(deps, found, wanted) {
+  const fields = await draftFields(deps, found);
   return fields["subject"] === wanted.subject && fields["customHtml"] === wanted.html && fields["isPublished"] === false;
 }
 async function readMauticState(deps, draft2) {
@@ -22716,8 +22722,9 @@ async function readMauticState(deps, draft2) {
     case "mautic.segment.remove_contact":
       return readMembership(deps, draft2);
     case "mautic.email.create_draft": {
-      const found = await findEmailByName(deps, draftParams(draft2).name);
-      return { exists: found.exists };
+      const { name, subject, html } = draftParams(draft2);
+      const found = await findEmailByName(deps, name);
+      return { exists: found.exists && await isSameDraft(deps, found, { subject, html }) };
     }
     default:
       throw unsupported(draft2.kind);
@@ -22984,7 +22991,7 @@ async function fetchMetaAdsSnapshot(deps, request) {
       if (id !== void 0) listed.add(id);
     }
     const unlistedIds = [...byId.keys()].filter((id) => !listed.has(id));
-    const unlistedStatus = entities.truncated ? null : "REMOVED";
+    const unlistedStatus = entities.truncated ? "UNKNOWN" : "REMOVED";
     const build2 = (conversionAction2) => {
       const rows2 = [];
       for (const entity2 of entities.rows) {
@@ -42406,24 +42413,22 @@ function visible(text5, pattern) {
 function literalJson(value) {
   return visible(canonicalJson(value), /[\p{Cf}\u2028\u2029]/gu);
 }
-var HTML_FULL_CHARS = 8e3;
-var HTML_EXCERPT_CHARS = 2e3;
-function dataBlock(text5) {
-  return text5.split("\n").map((line) => `    ${visible(line, /[\p{Cc}\p{Cf}\u2028\u2029]/gu)}`);
+var MIN_FENCE = 4;
+function fencedBlock(text5) {
+  const longest = (text5.match(/~+/g) ?? []).reduce((max, run2) => Math.max(max, run2.length), 0);
+  const fence = "~".repeat(Math.max(MIN_FENCE, longest + 1));
+  return [fence, ...text5.split("\n").map((line) => visible(line, /[\p{Cc}\p{Cf}\u2028\u2029]/gu)), fence];
 }
-function paramLines(action, index, planId) {
+function paramLines(action) {
   const html = action.params["html"];
   if (action.kind !== "mautic.email.create_draft" || typeof html !== "string") {
     return [`   params: ${literalJson(action.params)}`];
   }
   const rest = Object.fromEntries(Object.entries(action.params).filter(([key]) => key !== "html"));
-  const params = `   params: ${literalJson(rest)}`;
-  if (html.length <= HTML_FULL_CHARS) return [params, "   html:", ...dataBlock(html)];
   return [
-    params,
-    `   html: ${html.length} characters, sha256 ${sha256(html)}, first ${HTML_EXCERPT_CHARS} characters:`,
-    ...dataBlock(html.slice(0, HTML_EXCERPT_CHARS)),
-    `   The full HTML is not shown here. Read it before approving: autopilot-marketing preview ${planId} --json (actions[${index}].params.html).`
+    `   params: ${literalJson(rest)}`,
+    `   html: ${html.length} characters, sha256 ${sha256(html)}`,
+    ...fencedBlock(html)
   ];
 }
 function percent(fraction2, decimals) {
@@ -42555,7 +42560,7 @@ function renderPlanPreview(preview2, currency = "XXX") {
       "",
       `${index + 1}. ${action.kind} [${action.id}]`,
       `   entity: ${entityText(action.target)}`,
-      ...paramLines(action, index, plan2.id),
+      ...paramLines(action),
       ...caution === void 0 ? [] : [`   caution: ${caution}`],
       `   before: ${action.before === null ? "unknown (could not be read)" : literalJson(action.before)}`,
       `   after: ${literalJson(action.after)}`,
@@ -42996,10 +43001,9 @@ function monthlyImpact(finding) {
 function draftKey(draft2) {
   return canonicalJson([draft2.kind, draft2.target.level, draft2.target.id, draft2.params]);
 }
-function snapshotTarget(target, snapshot2, knownTargets) {
+function snapshotTarget(target, snapshot2) {
   const dataset = TARGET_DATASETS[target.level];
-  const row = dataset === void 0 ? void 0 : snapshot2?.datasets?.[dataset]?.find((item) => item.id === target.id);
-  const source = row ?? knownTargets.find((item) => item.level === target.level && item.id === target.id);
+  const source = dataset === void 0 ? void 0 : snapshot2?.datasets?.[dataset]?.find((item) => item.id === target.id);
   return {
     level: target.level,
     id: target.id,
@@ -43092,10 +43096,9 @@ ${problems.join("\n")}`, {
       hint: "Fix every listed problem and create the plan again."
     });
   }
-  const knownTargets = Array.isArray(input2.knownTargets) ? input2.knownTargets : [];
   const actions = [];
   for (const draft2 of input2.drafts) {
-    const normalized = { ...draft2, target: snapshotTarget(draft2.target, input2.snapshot, knownTargets) };
+    const normalized = { ...draft2, target: snapshotTarget(draft2.target, input2.snapshot) };
     const before = await input2.connector.readState(normalized);
     actions.push(buildAction(normalized, before));
   }
@@ -43276,6 +43279,12 @@ function evaluatePolicy(input2) {
     for (const action of plan2.actions) {
       const { target } = action;
       const needsCampaign = target.level === "ad_group" || target.level === "ad" || target.level === "keyword";
+      if (target.level === "account") {
+        if (protectedEntities.includes(target.id)) {
+          deny("The action targets a protected entity.", { actionId: action.id, observed: target.id });
+        }
+        continue;
+      }
       if (!target.name || needsCampaign && !target.campaignId) {
         deny("The target could not be checked against the protected list; create the plan from a fresh snapshot.", {
           actionId: action.id,
@@ -43928,6 +43937,40 @@ async function applyPlan(planId, runtime, options) {
     }
   }
 }
+var REVERT_DATASETS = {
+  ad_group: "ad_groups",
+  ad: "ads",
+  keyword: "keywords",
+  segment: "segments"
+};
+async function revertSnapshot(runtime, account, connector, drafts) {
+  const wanted = /* @__PURE__ */ new Set(["campaigns"]);
+  for (const draft2 of drafts) {
+    const dataset = REVERT_DATASETS[draft2.target.level];
+    if (dataset !== void 0) wanted.add(dataset);
+  }
+  const supported = connector.status().datasets;
+  const datasets = [...wanted].filter((dataset) => supported.includes(dataset));
+  const snapshot2 = await connector.fetchSnapshot({
+    account,
+    dateRange: lastNDays(7, runtime.now()),
+    // Without a supported dataset to name, the connector's default applies: all it supports.
+    ...datasets.length === 0 ? {} : { datasets }
+  });
+  runtime.store.saveSnapshot(snapshot2);
+  runtime.ledger.append({
+    event: "snapshot.created",
+    actor: { kind: "system", id: "autopilot" },
+    accountId: account.id,
+    data: {
+      snapshotId: snapshot2.id,
+      source: snapshot2.source,
+      dateRange: { start: snapshot2.dateRange.start, end: snapshot2.dateRange.end },
+      contentHash: snapshot2.contentHash
+    }
+  });
+  return snapshot2;
+}
 async function createRevertPlan(planId, runtime) {
   const plan2 = runtime.store.getPlan(planId);
   if (plan2.status !== "applied" && plan2.status !== "partial") {
@@ -43968,17 +44011,17 @@ async function createRevertPlan(planId, runtime) {
       `Nothing in this plan can be reverted. Skipped ${skipped.length} action(s): ${skipped.join("; ")}.`
     );
   }
+  const snapshot2 = await revertSnapshot(runtime, account, connector, drafts);
   const newPlan = await createPlan({
     account,
-    snapshot: null,
+    snapshot: snapshot2,
     drafts,
     title: `Revert: ${plan2.title}`,
     rationale: `Compensating changes for plan ${plan2.id}. Money already spent is not recovered.`,
     createdBy: "agent",
     connector,
     now: runtime.now(),
-    revertsPlanId: plan2.id,
-    knownTargets: plan2.actions.map((action) => action.target)
+    revertsPlanId: plan2.id
   });
   for (const [index, action] of newPlan.actions.entries()) {
     const original = verified[index];

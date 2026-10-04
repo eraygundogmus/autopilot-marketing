@@ -1,11 +1,12 @@
 import { randomBytes } from 'node:crypto';
+import { lastNDays } from '../core/dates';
 import { AutopilotError } from '../core/errors';
 import { digest } from '../core/ids';
 import { redact } from '../core/redact';
 import { ACTION_KINDS } from '../core/types';
 import type {
-  Action, ActionDraft, ActionResult, ApplyOutcome, ApprovalReceipt, Connector, GateDecision,
-  JsonObject, JsonValue, LedgerEntry, LedgerInput, Plan, Runtime, Snapshot,
+  AccountConfig, Action, ActionDraft, ActionResult, ApplyOutcome, ApprovalReceipt, Connector, DatasetName,
+  EntityLevel, GateDecision, JsonObject, JsonValue, LedgerEntry, LedgerInput, Plan, Runtime, Snapshot,
 } from '../core/types';
 import { actionSpec, planDigest } from './actions';
 import { createPlan } from './planner';
@@ -455,7 +456,49 @@ export async function applyPlan(planId: string, runtime: Runtime, options: Apply
   }
 }
 
-/** Builds and stores the compensating plan for an applied plan. It is applied like any other plan. */
+const REVERT_DATASETS: Partial<Record<EntityLevel, DatasetName>> = {
+  ad_group: 'ad_groups',
+  ad: 'ads',
+  keyword: 'keywords',
+  segment: 'segments',
+};
+
+/**
+ * Takes, stores and logs the snapshot a revert is judged on: campaigns for budget totals, plus the
+ * dataset of each reverted target, so names and ancestry are the current ones.
+ */
+async function revertSnapshot(
+  runtime: Runtime, account: AccountConfig, connector: Connector, drafts: ActionDraft[],
+): Promise<Snapshot> {
+  const wanted = new Set<DatasetName>(['campaigns']);
+  for (const draft of drafts) {
+    const dataset = REVERT_DATASETS[draft.target.level];
+    if (dataset !== undefined) wanted.add(dataset);
+  }
+  const supported = connector.status().datasets;
+  const datasets = [...wanted].filter((dataset) => supported.includes(dataset));
+  const snapshot = await connector.fetchSnapshot({
+    account, dateRange: lastNDays(7, runtime.now()),
+    // Without a supported dataset to name, the connector's default applies: all it supports.
+    ...(datasets.length === 0 ? {} : { datasets }),
+  });
+  runtime.store.saveSnapshot(snapshot);
+  runtime.ledger.append({
+    event: 'snapshot.created', actor: { kind: 'system', id: 'autopilot' }, accountId: account.id,
+    data: {
+      snapshotId: snapshot.id,
+      source: snapshot.source,
+      dateRange: { start: snapshot.dateRange.start, end: snapshot.dateRange.end },
+      contentHash: snapshot.contentHash,
+    },
+  });
+  return snapshot;
+}
+
+/**
+ * Builds and stores the compensating plan for an applied plan. It is applied like any other plan,
+ * and is bound to a snapshot taken now: a revert that cannot be checked on current facts is not created.
+ */
 export async function createRevertPlan(planId: string, runtime: Runtime): Promise<Plan> {
   const plan = runtime.store.getPlan(planId);
   if (plan.status !== 'applied' && plan.status !== 'partial') {
@@ -486,11 +529,11 @@ export async function createRevertPlan(planId: string, runtime: Runtime): Promis
     throw new AutopilotError('invalid_input',
       `Nothing in this plan can be reverted. Skipped ${skipped.length} action(s): ${skipped.join('; ')}.`);
   }
+  const snapshot = await revertSnapshot(runtime, account, connector, drafts);
   const newPlan = await createPlan({
-    account, snapshot: null, drafts, title: `Revert: ${plan.title}`,
+    account, snapshot, drafts, title: `Revert: ${plan.title}`,
     rationale: `Compensating changes for plan ${plan.id}. Money already spent is not recovered.`,
     createdBy: 'agent', connector, now: runtime.now(), revertsPlanId: plan.id,
-    knownTargets: plan.actions.map((action) => action.target),
   });
   // Planning reads again; a later change must not become permission to overwrite it.
   for (const [index, action] of newPlan.actions.entries()) {

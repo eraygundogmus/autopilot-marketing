@@ -90,8 +90,11 @@ function statusSpec(
     after: () => ({ status }),
     spend: (before): Spend => {
       if (before !== null && before['status'] === status) return { effect: 'none', deltaPerDay: 0 };
-      const budget = before === null ? undefined : before['dailyBudget'];
-      const amount = isFiniteNumber(budget) ? budget : null;
+      // deltaPerDay is the change to the daily spend ceiling. An entity without a daily budget of
+      // its own (an ad group, ad or keyword; an ad set or campaign whose budget is null, i.e. set
+      // one level up, shared or lifetime) spends inside a ceiling this action does not move.
+      const budget = !hasBudget || before === null ? undefined : before['dailyBudget'];
+      const amount = !hasBudget || budget === null ? 0 : isFiniteNumber(budget) ? budget : null;
       if (status === 'PAUSED') return { effect: 'decrease', deltaPerDay: amount === null ? null : 0 - amount };
       return { effect: 'increase', deltaPerDay: amount };
     },
@@ -121,8 +124,8 @@ function numericSpec(targetLevel: EntityLevel, field: 'dailyBudget' | 'bid', kin
       const to = after[field];
       if (!isFiniteNumber(from) || !isFiniteNumber(to)) return { effect: 'unknown', deltaPerDay: null };
       const delta = Math.round((to - from) * 1e6) / 1e6;
-      // A bid is a per-click ceiling, so its change does not translate into a daily amount.
-      return { effect: direction(delta), deltaPerDay: field === 'bid' ? null : delta === 0 ? 0 : delta };
+      // A bid is a per-click ceiling: it changes what is spent inside the daily budget, not the budget.
+      return { effect: direction(delta), deltaPerDay: field === 'bid' || delta === 0 ? 0 : delta };
     },
     inverse: (action) => {
       const previous = action.before === null ? undefined : action.before[field];
@@ -164,7 +167,8 @@ function negativeKeywordSpec(exists: boolean, opposite: ActionKind): SpecBody {
     after: () => ({ exists }),
     spend: (before): Spend => {
       if (before !== null && before['exists'] === exists) return { effect: 'none', deltaPerDay: 0 };
-      return { effect: exists ? 'decrease' : 'increase', deltaPerDay: null };
+      // A negative keyword changes which searches spend the budget, not the budget itself.
+      return { effect: exists ? 'decrease' : 'increase', deltaPerDay: 0 };
     },
     inverse: (action) => toggleInverse(action, 'exists', exists, opposite),
   };

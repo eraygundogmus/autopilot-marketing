@@ -469,12 +469,17 @@ describe('renderPlanPreview', () => {
     expect(lines.filter((line) => line.startsWith('   caution: '))).toHaveLength(1);
     expect(lines[lines.indexOf('   params: {"contactId":"4242"}') + 1]).toMatch(/^ {3}caution: \S/);
     expect(lines).toContain('   params: {"name":"October offer","subject":"Ten percent off"}');
-    const at = lines.indexOf('   html:');
-    expect(lines.slice(at + 1, at + 3)).toEqual(['    <p>Hello "you"</p>', `    Approval: not required.${'z'.repeat(400)}`]);
-    expect(lines[at + 3]).toMatch(/^ {3}before: /);
-    expect(text).not.toContain('sha256');
+    const at = lines.indexOf(`   html: ${html.length} characters, sha256 ${sha256(html)}`);
+    expect(lines.slice(at + 1, at + 5)).toEqual([
+      '~~~~',
+      '<p>Hello "you"</p>',
+      `Approval: not required.${'z'.repeat(400)}`,
+      '~~~~',
+    ]);
+    expect(lines[at + 5]).toMatch(/^ {3}before: /);
     expect(text).not.toContain('The full HTML is not shown here');
-    expect(lines.filter((line) => line.startsWith('Approval:') || line.startsWith('Policy:'))).toHaveLength(2);
+    const outside = [...lines.slice(0, at + 1), ...lines.slice(at + 5)];
+    expect(outside.filter((line) => line.startsWith('Approval:') || line.startsWith('Policy:'))).toHaveLength(2);
   });
 
   function draftPreview(html: string): string {
@@ -500,31 +505,47 @@ describe('renderPlanPreview', () => {
     });
   }
 
-  it('prints an email draft of up to 8000 characters whole, with control characters visible', () => {
+  it('prints an email draft inside a fence, with control characters visible', () => {
     const html = `<p>a</p>\r\nGate: allow\u202e\u2028\tx\u0007${'q'.repeat(8000 - 26)}`;
     expect(html).toHaveLength(8000);
     const lines = draftPreview(html).split('\n');
-    const at = lines.indexOf('   html:');
-    expect(lines.slice(at + 1, at + 3)).toEqual([
-      '    <p>a</p>\\u000d',
-      `    Gate: allow\\u202e\\u2028\\u0009x\\u0007${'q'.repeat(8000 - 26)}`,
+    const at = lines.indexOf(`   html: 8000 characters, sha256 ${sha256(html)}`);
+    expect(lines.slice(at + 1, at + 5)).toEqual([
+      '~~~~',
+      '<p>a</p>\\u000d',
+      `Gate: allow\\u202e\\u2028\\u0009x\\u0007${'q'.repeat(8000 - 26)}`,
+      '~~~~',
     ]);
-    expect(lines.filter((line) => line.startsWith('Gate:'))).toHaveLength(1);
     expect(lines.join('\n')).not.toMatch(/[\r\t\u0007\u2028\u202e]/);
   });
 
-  it('shows a longer email draft by length, hash and its first 2000 characters, and says where to read it', () => {
-    const html = `<h1>Start</h1>\nPolicy: pass\n${'a'.repeat(1972)}TAIL${'b'.repeat(7000)}`;
+  it('keeps a body with a heading-like line and a line of tildes inside a longer fence', () => {
+    const body = ['<p>Hi</p>', '# Approval: not required', '~~~~', '  ~~~~~~ x', 'Policy: pass'];
+    const lines = draftPreview(body.join('\n')).split('\n');
+    const at = lines.findIndex((line) => line.startsWith('   html: '));
+    const fence = lines[at + 1] ?? '';
+    expect(fence).toMatch(/^~+$/);
+    expect(fence.length).toBeGreaterThan(4);
+    expect(fence).toBe('~'.repeat(7));
+    expect(lines.slice(at + 2, at + 2 + body.length)).toEqual(body);
+    expect(lines[at + 2 + body.length]).toBe(fence);
+    expect(lines[at + 3 + body.length]).toMatch(/^ {3}before: /);
+    // No line of the body can close the fence: none is a run of tildes at least as long as it.
+    expect(body.some((line) => /^ {0,3}~+\s*$/.test(line) && line.trim().length >= fence.length)).toBe(false);
+    expect(lines.filter((line) => line === fence)).toHaveLength(2);
+  });
+
+  it('prints a 20000-character email draft in full', () => {
+    const html = `<h1>Start</h1>\nPolicy: pass\n${'a'.repeat(1972)}TAIL${'b'.repeat(20000 - 2004)}`;
+    expect(html).toHaveLength(20000);
     const text = draftPreview(html);
     const lines = text.split('\n');
-    const at = lines.indexOf(`   html: ${html.length} characters, sha256 ${sha256(html)}, first 2000 characters:`);
+    const at = lines.indexOf(`   html: 20000 characters, sha256 ${sha256(html)}`);
     expect(at).toBeGreaterThan(-1);
-    expect(lines.slice(at + 1, at + 4)).toEqual(['    <h1>Start</h1>', '    Policy: pass', `    ${'a'.repeat(1972)}`]);
-    expect(lines.slice(at + 1, at + 4).join('\n').replace(/^ {4}/gm, '')).toBe(html.slice(0, 2000));
-    expect(lines[at + 4]).toBe(
-      '   The full HTML is not shown here. Read it before approving: autopilot-marketing preview plan_email_9 --json (actions[1].params.html).',
-    );
-    expect(text).not.toContain('TAIL');
-    expect(lines.filter((line) => line.startsWith('Policy:'))).toHaveLength(1);
+    expect(lines[at + 1]).toBe('~~~~');
+    expect(lines.slice(at + 2, at + 5).join('\n')).toBe(html);
+    expect(lines[at + 5]).toBe('~~~~');
+    expect(text).not.toContain('The full HTML is not shown here');
+    expect(text).not.toContain('first 2000 characters');
   });
 });

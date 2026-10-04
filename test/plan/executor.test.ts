@@ -6,8 +6,8 @@ import { AutopilotError } from '../../src/core/errors';
 import { digest, shortId } from '../../src/core/ids';
 import { createStore } from '../../src/core/store';
 import type {
-  AccountConfig, Action, ActionDraft, ActionResult, ApprovalReceipt, Connector,
-  GateDecision, JsonObject, Judge, LedgerEntry, Paths, Plan, Runtime,
+  AccountConfig, Action, ActionDraft, ActionResult, ApprovalReceipt, AttrValue, Connector, DatasetName,
+  GateDecision, JsonObject, Judge, LedgerEntry, Paths, Plan, Row, Runtime, Snapshot, SnapshotRequest,
 } from '../../src/core/types';
 import { buildAction, planDigest } from '../../src/plan/actions';
 import { createApprovalService } from '../../src/plan/approval';
@@ -51,6 +51,10 @@ function stateKey(draft: ActionDraft): string {
   return `${draft.target.level}:${draft.target.id}`;
 }
 
+const LEVEL_DATASETS: Record<string, DatasetName> = {
+  campaign: 'campaigns', ad_group: 'ad_groups', ad: 'ads', keyword: 'keywords', segment: 'segments',
+};
+
 type ApplyArgs = Parameters<Connector['apply']>[1];
 type ReadStep = (draft: ActionDraft) => JsonObject | Promise<JsonObject>;
 type ApplyStep = (action: Action, options: ApplyArgs) => ActionResult | Promise<ActionResult>;
@@ -93,14 +97,44 @@ function fixture(actions: Action[] = [action('one')]) {
     if (!options.validateOnly) states.set(stateKey(item), { ...states.get(stateKey(item)), ...item.after });
     return { ok: true, dryRun: options.validateOnly, after: null };
   });
+  // Current entity metadata and rows the platform would report besides the entities under test.
+  const refs = new Map<string, { name?: string; campaignId?: string; adGroupId?: string }>();
+  for (const item of actions) {
+    const { level: _level, id: _id, ...ref } = item.target;
+    refs.set(stateKey(item), ref);
+  }
+  const extraRows: Partial<Record<DatasetName, Row[]>> = {};
+  const supported = { datasets: Object.values(LEVEL_DATASETS) };
+  const fetchSnapshot = vi.fn(async (request: SnapshotRequest): Promise<Snapshot> => {
+    const datasets: Partial<Record<DatasetName, Row[]>> = {};
+    for (const dataset of request.datasets ?? supported.datasets) datasets[dataset] = [...(extraRows[dataset] ?? [])];
+    for (const [key, state] of states) {
+      const [level = '', id = ''] = key.split(':');
+      const dataset = LEVEL_DATASETS[level];
+      const rows = dataset === undefined ? undefined : datasets[dataset];
+      if (rows === undefined) continue;
+      const attrs: Record<string, AttrValue> = {};
+      for (const [field, value] of Object.entries(state)) {
+        if (value === null || typeof value !== 'object') attrs[field] = value;
+      }
+      rows.push({ id, ...refs.get(key), metrics: {}, attrs });
+    }
+    const contentHash = digest(datasets);
+    return {
+      id: shortId('snap', { contentHash, range: request.dateRange }), schemaVersion: 1, platform: account.platform,
+      accountId: account.id, externalAccountId: account.externalId, source: 'api', currency: 'USD',
+      timezone: 'UTC', dateRange: request.dateRange, createdAt: now().toISOString(),
+      datasets, coverage: {}, warnings: [], contentHash,
+    };
+  });
   const connector: Connector = {
     platform: account.platform,
     source: 'api',
     status: () => ({
       platform: account.platform, accountId: account.id, source: 'api', ready: true,
-      missingEnv: [], datasets: [], actions: actions.map((item) => item.kind),
+      missingEnv: [], datasets: [...supported.datasets], actions: actions.map((item) => item.kind),
     }),
-    fetchSnapshot: async () => { throw new Error('Not used by executor.'); },
+    fetchSnapshot,
     readState,
     apply,
   };
@@ -162,6 +196,7 @@ function fixture(actions: Action[] = [action('one')]) {
   return {
     runtime, plan, account, store, ledger, approvals, connector, control, states, calls,
     readState, apply, readSteps, applySteps, gatePlan, gateSteps, approve, oldIntent,
+    refs, extraRows, supported, fetchSnapshot,
   };
 }
 
@@ -1034,7 +1069,7 @@ describe('createRevertPlan', () => {
     await applyPlan(f.plan.id, f.runtime, LIVE);
     const revert = await createRevertPlan(f.plan.id, f.runtime);
     expect(revert).toMatchObject({
-      status: 'proposed', revertsPlanId: f.plan.id, snapshotId: null, createdBy: 'agent',
+      status: 'proposed', revertsPlanId: f.plan.id, snapshotId: expect.stringMatching(/^snap_/), createdBy: 'agent',
       title: `Revert: ${f.plan.title}`,
       rationale: `Compensating changes for plan ${f.plan.id}. Money already spent is not recovered.`,
     });
@@ -1048,7 +1083,8 @@ describe('createRevertPlan', () => {
       data: { revertsPlanId: f.plan.id, digest: revert.digest, actions: 3 },
     });
     expect(f.store.findReceipts(revert.id)).toEqual([]);
-    await expect(applyPlan(revert.id, f.runtime, LIVE)).rejects.toMatchObject({ code: 'policy_denied' });
+    // Re-enabling ads moves spend inside unchanged budgets: the policy allows it, a person still has to approve.
+    await expect(applyPlan(revert.id, f.runtime, LIVE)).rejects.toMatchObject({ code: 'approval_required' });
   });
 
   it.each([
@@ -1069,6 +1105,83 @@ describe('createRevertPlan', () => {
     const note = (await applyPlan(revert.id, f.runtime, DRY)).results[0]?.note ?? '';
     expect(note).not.toContain('could not be checked against the protected list');
     expect(note.includes('targets a protected entity')).toBe(denied);
+  });
+
+  function approvedBudgetCut() {
+    const lower = buildAction({
+      kind: 'google_ads.campaign.set_daily_budget', target: { level: 'campaign', id: 'c1', name: 'Generic Search' },
+      params: { dailyBudget: 50 }, rationale: 'Lower the reviewed budget.',
+    }, { dailyBudget: 60 });
+    const f = fixture([lower]);
+    f.approve();
+    return f;
+  }
+
+  it('judges a revert on the current name of a campaign renamed to a protected one', async () => {
+    const f = approvedBudgetCut();
+    await applyPlan(f.plan.id, f.runtime, LIVE);
+    f.refs.set('campaign:c1', { name: 'Acme Brand Search' });
+    f.account.protected = ['*brand*'];
+    const revert = await createRevertPlan(f.plan.id, f.runtime);
+    expect(revert.actions[0]?.target).toEqual({ level: 'campaign', id: 'c1', name: 'Acme Brand Search' });
+    expect((await applyPlan(revert.id, f.runtime, DRY)).results[0]?.note).toContain('targets a protected entity');
+    await expect(applyPlan(revert.id, f.runtime, LIVE)).rejects.toMatchObject({
+      code: 'policy_denied', message: expect.stringContaining('targets a protected entity'),
+    });
+    expect(f.apply.mock.calls.filter(([, options]) => !options.validateOnly)).toHaveLength(1);
+  });
+
+  it('binds a budget-raising revert to a fresh stored snapshot of the datasets it needs', async () => {
+    const f = approvedBudgetCut();
+    await applyPlan(f.plan.id, f.runtime, LIVE);
+    f.refs.set('campaign:c1', { name: 'Renamed Generic Search' });
+    f.account.protected = ['*brand*'];
+    f.extraRows.campaigns = [{
+      id: 'c2', name: 'Other Search', metrics: {}, attrs: { status: 'ENABLED', dailyBudget: 1000 },
+    }];
+    const revert = await createRevertPlan(f.plan.id, f.runtime);
+    expect(f.fetchSnapshot).toHaveBeenCalledTimes(1);
+    expect(f.fetchSnapshot).toHaveBeenCalledWith({
+      account: f.account, dateRange: { start: '2026-09-27', end: '2026-10-03' }, datasets: ['campaigns'],
+    });
+    const snapshot = f.store.getSnapshot(revert.snapshotId!);
+    expect(snapshot.datasets.campaigns?.map((row) => row.id)).toEqual(['c2', 'c1']);
+    expect(revert.actions[0]?.target.name).toBe('Renamed Generic Search');
+    expect(revert.digest).toBe(planDigest(revert));
+    expect(f.ledger.read({ events: ['snapshot.created', 'plan.created'] }).map((entry) => entry.event))
+      .toEqual(['snapshot.created', 'plan.created']);
+    expect(f.ledger.read({ events: ['snapshot.created'] })[0]).toMatchObject({
+      actor: { kind: 'system', id: 'autopilot' }, accountId: f.account.id,
+      data: {
+        snapshotId: snapshot.id, source: 'api', dateRange: { start: '2026-09-27', end: '2026-10-03' },
+        contentHash: snapshot.contentHash,
+      },
+    });
+    expect((await applyPlan(revert.id, f.runtime, DRY)).results[0]?.note).toBeUndefined();
+    await expect(applyPlan(revert.id, f.runtime, LIVE)).rejects.toMatchObject({ code: 'approval_required' });
+  });
+
+  it('requests the dataset of each reverted target, limited to what the connector lists', async () => {
+    const f = fixture([action('one')]);
+    f.approve();
+    await applyPlan(f.plan.id, f.runtime, LIVE);
+    await createRevertPlan(f.plan.id, f.runtime);
+    expect(f.fetchSnapshot.mock.calls[0]?.[0].datasets).toEqual(['campaigns', 'ads']);
+    f.supported.datasets = ['ads', 'keywords'];
+    await createRevertPlan(f.plan.id, f.runtime);
+    expect(f.fetchSnapshot.mock.calls[1]?.[0].datasets).toEqual(['ads']);
+  });
+
+  it('creates no revert when the snapshot cannot be taken', async () => {
+    const f = approvedBudgetCut();
+    await applyPlan(f.plan.id, f.runtime, LIVE);
+    f.fetchSnapshot.mockRejectedValueOnce(new AutopilotError('platform_error', 'Snapshot unavailable.'));
+    await expect(createRevertPlan(f.plan.id, f.runtime)).rejects.toMatchObject({
+      code: 'platform_error', message: 'Snapshot unavailable.',
+    });
+    expect(f.store.listPlans()).toHaveLength(1);
+    expect(f.store.listSnapshots()).toEqual([]);
+    expect(f.ledger.read({ events: ['snapshot.created', 'plan.created'] })).toEqual([]);
   });
 
   it('requires fresh approval for a revert that passes policy', async () => {

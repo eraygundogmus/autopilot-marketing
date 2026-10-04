@@ -42,13 +42,12 @@ function draftKey(draft: ActionDraft): string {
 }
 
 /**
- * Target names and ancestry come from the referenced snapshot row, or, when there is no such row,
- * from a known target of the same level and id. The draft's own metadata is never used.
+ * Target names and ancestry come from the referenced snapshot row and from nowhere else: the
+ * draft's own metadata is supplied by the caller and is never used.
  */
-function snapshotTarget(target: EntityRef, snapshot: Snapshot | null, knownTargets: EntityRef[]): EntityRef {
+function snapshotTarget(target: EntityRef, snapshot: Snapshot | null): EntityRef {
   const dataset = TARGET_DATASETS[target.level];
-  const row = dataset === undefined ? undefined : snapshot?.datasets?.[dataset]?.find((item) => item.id === target.id);
-  const source = row ?? knownTargets.find((item) => item.level === target.level && item.id === target.id);
+  const source = dataset === undefined ? undefined : snapshot?.datasets?.[dataset]?.find((item) => item.id === target.id);
   return {
     level: target.level,
     id: target.id,
@@ -166,8 +165,6 @@ export async function createPlan(input: {
   connector: Connector;
   now: Date;
   revertsPlanId?: string;
-  /** Targets whose metadata an earlier plan resolved from a snapshot; used only without a snapshot row. */
-  knownTargets?: EntityRef[];
 }): Promise<Plan> {
   const problems = collectProblems(input);
   if (problems.length > 0) {
@@ -176,10 +173,9 @@ export async function createPlan(input: {
     });
   }
 
-  const knownTargets = Array.isArray(input.knownTargets) ? input.knownTargets : [];
   const actions: Action[] = [];
   for (const draft of input.drafts) {
-    const normalized = { ...draft, target: snapshotTarget(draft.target, input.snapshot, knownTargets) };
+    const normalized = { ...draft, target: snapshotTarget(draft.target, input.snapshot) };
     const before = await input.connector.readState(normalized);
     actions.push(buildAction(normalized, before));
   }

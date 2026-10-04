@@ -248,8 +248,9 @@ export async function fetchMetaAdsSnapshot(deps: ConnectorDeps, request: Snapsho
     }
     const unlistedIds = [...byId.keys()].filter((id) => !listed.has(id));
     // Every Insights row becomes a dataset row: the list edges omit archived entities, their spend still counts.
-    // Absence from the list proves removal only when the list was read to its end.
-    const unlistedStatus: AttrValue = entities.truncated ? null : 'REMOVED';
+    // Absence from the list proves removal only when the list was read to its end. Otherwise the status is
+    // 'UNKNOWN', never null: the audit reads a null or absent status as active and would act on the row.
+    const unlistedStatus: AttrValue = entities.truncated ? 'UNKNOWN' : 'REMOVED';
     const build = (conversionAction: string | undefined): Row[] => {
       const rows: Row[] = [];
       for (const entity of entities.rows) {

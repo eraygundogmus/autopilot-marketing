@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { activeRows } from '../../src/audit/helpers';
 import { createMetaAdsConnector } from '../../src/connectors/meta-ads';
 import { fetchMetaAdsSnapshot } from '../../src/connectors/meta-ads-read';
 import { AutopilotError } from '../../src/core/errors';
@@ -272,7 +273,7 @@ describe('fetchMetaAdsSnapshot', () => {
     expect(fields).toContain('campaign_name');
   });
 
-  it('leaves the status of an unmatched Insights row unknown when the entity list was cut off', async () => {
+  it('gives an unmatched Insights row the non-active status UNKNOWN when the entity list was cut off', async () => {
     const insights = [
       { campaign_id: 'c1', campaign_name: 'Listed', spend: '10' },
       { campaign_id: 'c500', campaign_name: 'On a later page', spend: '40' },
@@ -292,7 +293,11 @@ describe('fetchMetaAdsSnapshot', () => {
     const rows = snapshot.datasets.campaigns ?? [];
     const later = rows.find((row) => row.id === 'c500');
     expect(later).toMatchObject({ name: 'On a later page' });
-    expect(later?.attrs['status']).toBeNull();
+    expect(later?.attrs['status']).toBe('UNKNOWN');
+    const active = activeRows(snapshot, 'campaigns').map((row) => row.id);
+    expect(active).toContain('c1');
+    expect(active).not.toContain('c500');
+    expect(active).not.toContain('c501');
     expect(later?.metrics.cost).toBe(40);
     expect(rows.find((row) => row.id === 'c1')?.attrs['status']).toBe('ENABLED');
     expect(snapshot.coverage.campaigns?.status).toBe('partial');

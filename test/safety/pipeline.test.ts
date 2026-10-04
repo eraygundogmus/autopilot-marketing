@@ -182,6 +182,34 @@ describe('an approval covers exactly one plan, once', () => {
   });
 });
 
+describe('an applied change can be undone, under the same rules', () => {
+  it('reverts through a new plan that needs its own approval', async () => {
+    const { runtime, home, mcp } = await setup({ autonomy: 'approve' });
+    const planId = await pausePlan(mcp, await snapshot(mcp));
+    await mcp.call('plan_apply', { planId, dryRun: false, receiptId: await approveAsPerson(runtime, mcp, planId) });
+    expect(demoState(home)).toContain('"PAUSED"');
+
+    const revert = await mcp.call('plan_revert', { planId });
+    expect(revert.isError, revert.text).toBe(false);
+    const revertId = revert.structured?.['planId'] as string;
+    expect(revertId).not.toBe(planId);
+
+    const unapproved = await mcp.call('plan_apply', { planId: revertId, dryRun: false });
+    expect(errorCode(unapproved)).toBe('approval_required');
+    expect(demoState(home)).toContain('"PAUSED"');
+
+    const applied = await mcp.call('plan_apply', {
+      planId: revertId,
+      dryRun: false,
+      receiptId: await approveAsPerson(runtime, mcp, revertId),
+    });
+    expect(applied.isError, applied.text).toBe(false);
+    expect(applied.structured?.['applied']).toBe(1);
+    expect(demoState(home)).toContain('"ENABLED"');
+    expect(runtime.ledger.verify().ok).toBe(true);
+  });
+});
+
 describe('the policy is enforced by the server', () => {
   it('denies a budget change above the limit, whatever the caller says', async () => {
     const { mcp } = await setup({ autonomy: 'approve' });

@@ -343,30 +343,22 @@ describe('createPlan', () => {
     expect(plan.actions[0]?.target).toEqual({ level: 'segment', id: 'segment-1', name: 'Newsletter' });
   });
 
-  it('fills target metadata from a known target only when the snapshot has no row', async () => {
+  it('takes target metadata only from the snapshot and drops what the caller supplied', async () => {
     const forged = { name: 'Safe name', campaignId: 'forged-parent', adGroupId: 'forged-group' };
     const drafts = [
       pause('ad-1', { kind: 'google_ads.ad.pause', target: { level: 'ad', id: 'ad-1', ...forged } }),
       pause('ad-2', { kind: 'google_ads.ad.pause', target: { level: 'ad', id: 'ad-2', ...forged } }),
-      pause('ad-3', { kind: 'google_ads.ad.pause', target: { level: 'ad', id: 'ad-3', ...forged } }),
-    ];
-    const knownTargets: EntityRef[] = [
-      { level: 'ad', id: 'ad-1', name: 'Known ad', campaignId: 'c1', adGroupId: 'g1' },
-      { level: 'ad', id: 'ad-2', name: 'Stale ad', campaignId: 'c-old', adGroupId: 'g-old' },
-      { level: 'campaign', id: 'ad-3', name: 'Another level' },
     ];
     const data = snapshot({ ads: [{ id: 'ad-2', name: 'Brand ad', campaignId: 'c2', metrics: {}, attrs: {} }] });
-    const withSnapshot = await createPlan({ ...base(drafts), snapshot: data, knownTargets });
+    const withSnapshot = await createPlan({ ...base(drafts), snapshot: data });
     expect(withSnapshot.actions.map((item) => item.target)).toEqual([
-      { level: 'ad', id: 'ad-1', name: 'Known ad', campaignId: 'c1', adGroupId: 'g1' },
+      { level: 'ad', id: 'ad-1' },
       { level: 'ad', id: 'ad-2', name: 'Brand ad', campaignId: 'c2' },
-      { level: 'ad', id: 'ad-3' },
     ]);
-    const withoutSnapshot = await createPlan({ ...base(drafts), knownTargets });
+    const withoutSnapshot = await createPlan(base(drafts));
     expect(withoutSnapshot.actions.map((item) => item.target)).toEqual([
-      knownTargets[0],
-      knownTargets[1],
-      { level: 'ad', id: 'ad-3' },
+      { level: 'ad', id: 'ad-1' },
+      { level: 'ad', id: 'ad-2' },
     ]);
   });
 

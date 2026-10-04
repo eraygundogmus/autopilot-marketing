@@ -140,24 +140,32 @@ async function findEmailByName(deps: ConnectorDeps, name: string): Promise<Exist
 
 const DRAFT_FIELDS = ['subject', 'customHtml', 'isPublished'] as const;
 
+/** The fields of an existing email that the draft comparison needs; throws when they cannot be read. */
+async function draftFields(deps: ConnectorDeps, found: ExistingEmail): Promise<EmailFields> {
+  const listed = found.fields;
+  if (listed !== null && DRAFT_FIELDS.every((key) => listed[key] !== undefined)) return listed;
+  if (found.id === null) {
+    throw new AutopilotError('platform_error', 'Mautic listed an email without an id; its content cannot be read.');
+  }
+  const body = await send(deps, `/emails/${encodeURIComponent(found.id)}`, { method: 'GET' });
+  const email = isRecord(body) ? body['email'] : undefined;
+  if (!isRecord(email)) {
+    throw new AutopilotError('platform_error', `Mautic did not return the content of email ${found.id}.`);
+  }
+  return email;
+}
+
 /**
  * An existing email stands in for the requested draft only when its subject and body equal the requested ones and
- * it is unpublished. A field that cannot be read counts as different. The detail endpoint is asked only when the
- * list entry lacks one of the compared fields.
+ * it is unpublished. The detail endpoint is asked only when the list entry lacks one of the compared fields. When
+ * the compared fields cannot be read at all the call throws: neither answer may be guessed.
  */
 async function isSameDraft(
   deps: ConnectorDeps,
   found: ExistingEmail,
   wanted: { subject: string; html: string },
 ): Promise<boolean> {
-  let fields = found.fields;
-  const listed = fields;
-  if ((listed === null || DRAFT_FIELDS.some((key) => listed[key] === undefined)) && found.id !== null) {
-    const body = await send(deps, `/emails/${encodeURIComponent(found.id)}`, { method: 'GET' });
-    const email = isRecord(body) ? body['email'] : undefined;
-    fields = isRecord(email) ? email : null;
-  }
-  if (fields === null) return false;
+  const fields = await draftFields(deps, found);
   return (
     fields['subject'] === wanted.subject && fields['customHtml'] === wanted.html && fields['isPublished'] === false
   );
@@ -169,8 +177,10 @@ export async function readMauticState(deps: ConnectorDeps, draft: ActionDraft): 
     case 'mautic.segment.remove_contact':
       return readMembership(deps, draft);
     case 'mautic.email.create_draft': {
-      const found = await findEmailByName(deps, draftParams(draft).name);
-      return { exists: found.exists };
+      // `exists` means the requested draft itself exists, not merely an email carrying its name.
+      const { name, subject, html } = draftParams(draft);
+      const found = await findEmailByName(deps, name);
+      return { exists: found.exists && (await isSameDraft(deps, found, { subject, html })) };
     }
     default:
       throw unsupported(draft.kind);
