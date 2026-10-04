@@ -57,6 +57,22 @@ function snapshotTarget(target: EntityRef, snapshot: Snapshot | null): EntityRef
   };
 }
 
+/**
+ * An account-level action always applies to the configured account, so its target is that account:
+ * the id (and name) the caller supplied is ignored, and the protected list sees the real account id.
+ */
+function accountTarget(account: AccountConfig): EntityRef {
+  return {
+    level: 'account',
+    id: account.id,
+    ...(typeof account.label !== 'string' || account.label === '' ? {} : { name: account.label }),
+  };
+}
+
+function planTarget(target: EntityRef, account: AccountConfig, snapshot: Snapshot | null): EntityRef {
+  return target.level === 'account' ? accountTarget(account) : snapshotTarget(target, snapshot);
+}
+
 /** Suggested actions of the findings, de-duplicated by kind and target, largest impact first. */
 export function draftsFromFindings(findings: Finding[], maxActions: number = DEFAULT_MAX_ACTIONS): ActionDraft[] {
   const limit = Number.isFinite(maxActions) ? Math.max(0, Math.floor(maxActions)) : DEFAULT_MAX_ACTIONS;
@@ -92,7 +108,7 @@ function draftProblems(draft: unknown): string[] {
 }
 
 /** `level:id:field` keys the draft writes; empty when its kind or shape is not usable. */
-function writeKeys(draft: ActionDraft): string[] {
+function writeKeys(draft: ActionDraft, account: AccountConfig): string[] {
   if (!isRecord(draft) || !isRecord(draft.target) || !isRecord(draft.params) || !isActionKind(draft.kind)) return [];
   const spec = actionSpec(draft.kind);
   let fields: string[];
@@ -101,7 +117,8 @@ function writeKeys(draft: ActionDraft): string[] {
   } catch {
     return [];
   }
-  const entity = canonicalJson([draft.target.level, draft.target.id]);
+  const targetId = draft.target.level === 'account' ? account.id : draft.target.id;
+  const entity = canonicalJson([draft.target.level, targetId]);
   return fields.map((field) =>
     CHILD_FIELDS.includes(field) ? `${entity}:${field}:${canonicalJson(draft.params)}` : `${entity}:${field}`,
   );
@@ -139,7 +156,7 @@ function collectProblems(input: {
       }
     }
     const clashes = new Set<number>();
-    for (const key of writeKeys(draft)) {
+    for (const key of writeKeys(draft, input.account)) {
       const earlier = writers.get(key);
       if (earlier === undefined) writers.set(key, index);
       else clashes.add(earlier);
@@ -175,7 +192,7 @@ export async function createPlan(input: {
 
   const actions: Action[] = [];
   for (const draft of input.drafts) {
-    const normalized = { ...draft, target: snapshotTarget(draft.target, input.snapshot) };
+    const normalized = { ...draft, target: planTarget(draft.target, input.account, input.snapshot) };
     const before = await input.connector.readState(normalized);
     actions.push(buildAction(normalized, before));
   }

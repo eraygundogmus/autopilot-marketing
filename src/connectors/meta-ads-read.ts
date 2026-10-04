@@ -463,5 +463,7 @@ export async function fetchMetaAdsSnapshot(deps: ConnectorDeps, request: Snapsho
     coverage,
     warnings,
     now: deps.now(),
+    // Absent when no conversion action was found: the conversions are then 0 by construction, not by definition.
+    ...(conversionAction === undefined ? {} : { conversionDefinition: conversionAction }),
   });
 }

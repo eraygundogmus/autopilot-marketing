@@ -123,6 +123,11 @@ export interface Snapshot {
   datasets: Partial<Record<DatasetName, Row[]>>;
   coverage: Partial<Record<DatasetName, DatasetCoverage>>;
   warnings: string[];
+  /**
+   * What `conversions` counts, when the platform leaves a choice (the Meta action type, for example
+   * 'purchase' or 'lead'). Two snapshots are comparable on conversions only when this is equal.
+   */
+  conversionDefinition?: string;
   /** sha256 of the canonical JSON of `datasets`. */
   contentHash: string;
 }

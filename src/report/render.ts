@@ -8,14 +8,16 @@ const MAX_ACCOUNT_TEXT = 80;
 /**
  * Text that came from an ad account, made inert for Markdown and for a reader: control and
  * invisible format characters (newlines, bidi overrides) become spaces, backticks and double
- * quotes become apostrophes so the text cannot close its own quoting or a code span, and pipes
- * cannot break a table row.
+ * quotes become apostrophes so the text cannot close its own quoting or a code span, pipes cannot
+ * break a table row, and a closing bracket never touches an opening parenthesis, so no inline link
+ * or image (`[text](url)`, `![alt](url)`) can hide its destination behind its label.
  */
 export function inert(text: string, max: number): string {
   const flat = text
     .replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')
     .replace(/[`"]/g, '\'')
     .replace(/\|/g, '/')
+    .replace(/\](?=\()/g, '] ')
     .replace(/ {2,}/g, ' ')
     .trim();
   const chars = Array.from(flat);
@@ -52,19 +54,26 @@ function fencedBlock(text: string): string[] {
 }
 
 /**
- * What the action does, complete: every parameter as canonical JSON. An email body is identified by
- * its length and sha256 and printed whole, whatever its length, as a fenced block.
+ * What the action does, complete: one fenced block holding the lines `params: …`, `before: …` and
+ * `after: …`, each value as untruncated canonical JSON on one line, so that nothing in a value is
+ * read as Markdown. An email body is identified by its length and sha256 and printed whole, whatever
+ * its length, as a fenced block of its own.
  */
-function paramLines(action: Action): string[] {
+function valueLines(action: Action): string[] {
   const html = action.params['html'];
-  if (action.kind !== 'mautic.email.create_draft' || typeof html !== 'string') {
-    return [`   params: ${literalJson(action.params)}`];
-  }
-  const rest = Object.fromEntries(Object.entries(action.params).filter(([key]) => key !== 'html'));
+  const draft = action.kind === 'mautic.email.create_draft' && typeof html === 'string' ? html : null;
+  const params =
+    draft === null
+      ? action.params
+      : Object.fromEntries(Object.entries(action.params).filter(([key]) => key !== 'html'));
+  const values = [
+    `params: ${literalJson(params)}`,
+    `before: ${action.before === null ? 'unknown (could not be read)' : literalJson(action.before)}`,
+    `after: ${literalJson(action.after)}`,
+  ];
   return [
-    `   params: ${literalJson(rest)}`,
-    `   html: ${html.length} characters, sha256 ${sha256(html)}`,
-    ...fencedBlock(html),
+    ...fencedBlock(values.join('\n')),
+    ...(draft === null ? [] : [`   html: ${draft.length} characters, sha256 ${sha256(draft)}`, ...fencedBlock(draft)]),
   ];
 }
 
@@ -199,8 +208,8 @@ export function renderKpiReport(report: KpiReport): string {
 
 /**
  * The diff a human approves: one block per action with its parameters, before, after and spend
- * effect, then the gates. `params`, `before` and `after` are printed as untruncated canonical JSON, whose string escaping keeps
- * newlines and control characters on one line.
+ * effect, then the gates. Everything that came from the agent or the ad account is literal: values
+ * are inside fenced code, names and rationales go through `accountText`.
  */
 export function renderPlanPreview(
   preview: Pick<PlanPreview, 'plan' | 'policy' | 'gate' | 'approval' | 'totals'>,
@@ -220,16 +229,18 @@ export function renderPlanPreview(
 
   plan.actions.forEach((action, index) => {
     const delta =
-      action.spendDeltaPerDay === null ? '' : ` (${signedMoney(action.spendDeltaPerDay, currency)} per day)`;
+      action.spendDeltaPerDay === null
+        ? ''
+        : action.spendDeltaPerDay === 0
+          ? ' (daily budget unchanged)'
+          : ` (${signedMoney(action.spendDeltaPerDay, currency)} per day)`;
     const caution = actionSpec(action.kind).caution;
     lines.push(
       '',
       `${index + 1}. ${action.kind} [${action.id}]`,
       `   entity: ${entityText(action.target)}`,
-      ...paramLines(action),
+      ...valueLines(action),
       ...(caution === undefined ? [] : [`   caution: ${caution}`]),
-      `   before: ${action.before === null ? 'unknown (could not be read)' : literalJson(action.before)}`,
-      `   after: ${literalJson(action.after)}`,
       `   spend effect: ${action.spendEffect}${delta}`,
       `   reversibility: ${action.reversible}`,
       `   rationale: ${accountText(action.rationale, 400)}`,

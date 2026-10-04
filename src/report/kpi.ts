@@ -18,6 +18,23 @@ const KPI_KEYS: Array<keyof KpiSet> = [
 
 const TOP_CAMPAIGNS = 10;
 
+/** The KPIs that depend on what `conversions` counts. */
+const CONVERSION_KEYS: ReadonlySet<keyof KpiSet> = new Set<keyof KpiSet>([
+  'conversions',
+  'conversionValue',
+  'cpa',
+  'roas',
+  'conversionRate',
+]);
+
+/** The two definitions when both snapshots state one and they differ, otherwise null. */
+function definitionMismatch(current: Snapshot, previous: Snapshot | null): { current: string; previous: string } | null {
+  const now = current.conversionDefinition;
+  const before = previous?.conversionDefinition;
+  if (now === undefined || before === undefined || now === before) return null;
+  return { current: now, previous: before };
+}
+
 function totalRows(snapshot: Snapshot): Row[] {
   const rows = snapshot.datasets.campaigns ?? snapshot.datasets.daily;
   if (rows === undefined) {
@@ -54,14 +71,15 @@ function buildFacts(input: {
   previous: KpiSet | null;
   range: DateRange;
   currency: string;
+  mismatch: { current: string; previous: string } | null;
 }): string[] {
-  const { current, previous, range, currency } = input;
+  const { current, previous, range, currency, mismatch } = input;
   const period = `from ${range.start} to ${range.end}`;
   const facts: string[] = [];
   const add = (label: string, verb: string, key: keyof KpiSet, format: (value: number) => string): void => {
     const value = current[key];
     if (value === null) return;
-    const before = previous === null ? null : previous[key];
+    const before = previous === null || (mismatch !== null && CONVERSION_KEYS.has(key)) ? null : previous[key];
     const previousText = before === null ? null : format(before);
     facts.push(`${label} ${verb} ${format(value)} ${period}${comparison(relativeChange(value, before), previousText)}.`);
   };
@@ -70,6 +88,11 @@ function buildFacts(input: {
   add('CPA', 'was', 'cpa', (value) => formatMoney(value, currency));
   add('ROAS', 'was', 'roas', (value) => value.toFixed(2));
   add('CTR', 'was', 'ctr', (value) => formatPercent(value, 2));
+  if (mismatch !== null) {
+    facts.push(
+      `Conversions are not comparable between the two periods: the current period counts "${mismatch.current}", the previous one "${mismatch.previous}". Set META_CONVERSION_ACTION to fix the definition.`,
+    );
+  }
   return facts;
 }
 
@@ -89,10 +112,13 @@ export function buildKpiReport(input: { current: Snapshot; previous: Snapshot | 
   const currentKpis = kpis(sumMetrics(totalRows(current)));
   const previousKpis = previous === null ? null : kpis(sumMetrics(totalRows(previous)));
 
+  const mismatch = definitionMismatch(current, previous);
+
   const deltas: KpiDelta[] = KPI_KEYS.map((metric) => {
     const now = currentKpis[metric];
     const before = previousKpis === null ? null : previousKpis[metric];
-    return { metric, current: now, previous: before, change: relativeChange(now, before) };
+    const comparable = mismatch === null || !CONVERSION_KEYS.has(metric);
+    return { metric, current: now, previous: before, change: comparable ? relativeChange(now, before) : null };
   });
 
   const previousById = new Map<string, Row>();
@@ -124,6 +150,6 @@ export function buildKpiReport(input: { current: Snapshot; previous: Snapshot | 
         : { snapshotId: previous.id, dateRange: previous.dateRange, kpis: previousKpis },
     deltas,
     topCampaigns,
-    facts: buildFacts({ current: currentKpis, previous: previousKpis, range: current.dateRange, currency }),
+    facts: buildFacts({ current: currentKpis, previous: previousKpis, range: current.dateRange, currency, mismatch }),
   };
 }

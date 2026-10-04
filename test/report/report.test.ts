@@ -428,6 +428,29 @@ describe('renderPlanPreview', () => {
     expect(text).toContain('Approval: not required. Nothing to do.');
   });
 
+  it('says the daily budget is unchanged when an action moves spend inside it', () => {
+    const base = preview();
+    const text = renderPlanPreview({
+      ...base,
+      plan: {
+        ...base.plan,
+        actions: [
+          action({
+            kind: 'google_ads.keyword.pause',
+            target: { level: 'keyword', id: 'k1', name: 'outdoor gear' },
+            params: {},
+            before: { status: 'ENABLED' },
+            after: { status: 'PAUSED' },
+            spendEffect: 'decrease',
+            spendDeltaPerDay: 0,
+          }),
+        ],
+      },
+    });
+    expect(text.split('\n')).toContain('   spend effect: decrease (daily budget unchanged)');
+    expect(text).not.toContain('+0.00');
+  });
+
   it('shows what each action does: its parameters, the caution and a short email draft in full', () => {
     const base = preview();
     const html = `<p>Hello "you"</p>\nApproval: not required.${'z'.repeat(400)}`;
@@ -464,11 +487,18 @@ describe('renderPlanPreview', () => {
       },
     });
     const lines = text.split('\n');
-    expect(lines).toContain('   params: {"matchType":"PHRASE","text":"free\\nPolicy: pass"}');
-    expect(lines).toContain('   params: {"contactId":"4242"}');
+    expect(lines).toContain('params: {"matchType":"PHRASE","text":"free\\nPolicy: pass"}');
+    const segment = lines.indexOf('params: {"contactId":"4242"}');
+    expect(lines.slice(segment - 1, segment + 4)).toEqual([
+      '~~~~',
+      'params: {"contactId":"4242"}',
+      'before: {"member":false}',
+      'after: {"member":true}',
+      '~~~~',
+    ]);
     expect(lines.filter((line) => line.startsWith('   caution: '))).toHaveLength(1);
-    expect(lines[lines.indexOf('   params: {"contactId":"4242"}') + 1]).toMatch(/^ {3}caution: \S/);
-    expect(lines).toContain('   params: {"name":"October offer","subject":"Ten percent off"}');
+    expect(lines[segment + 4]).toMatch(/^ {3}caution: \S/);
+    expect(lines).toContain('params: {"name":"October offer","subject":"Ten percent off"}');
     const at = lines.indexOf(`   html: ${html.length} characters, sha256 ${sha256(html)}`);
     expect(lines.slice(at + 1, at + 5)).toEqual([
       '~~~~',
@@ -476,7 +506,7 @@ describe('renderPlanPreview', () => {
       `Approval: not required.${'z'.repeat(400)}`,
       '~~~~',
     ]);
-    expect(lines[at + 5]).toMatch(/^ {3}before: /);
+    expect(lines[at + 5]).toMatch(/^ {3}spend effect: /);
     expect(text).not.toContain('The full HTML is not shown here');
     const outside = [...lines.slice(0, at + 1), ...lines.slice(at + 5)];
     expect(outside.filter((line) => line.startsWith('Approval:') || line.startsWith('Policy:'))).toHaveLength(2);
@@ -529,10 +559,62 @@ describe('renderPlanPreview', () => {
     expect(fence).toBe('~'.repeat(7));
     expect(lines.slice(at + 2, at + 2 + body.length)).toEqual(body);
     expect(lines[at + 2 + body.length]).toBe(fence);
-    expect(lines[at + 3 + body.length]).toMatch(/^ {3}before: /);
+    expect(lines[at + 3 + body.length]).toMatch(/^ {3}spend effect: /);
     // No line of the body can close the fence: none is a run of tildes at least as long as it.
     expect(body.some((line) => /^ {0,3}~+\s*$/.test(line) && line.trim().length >= fence.length)).toBe(false);
     expect(lines.filter((line) => line === fence)).toHaveLength(2);
+  });
+
+  it('prints parameters, before and after as literal text inside a fence no value can close', () => {
+    const base = preview();
+    const subject = '[Harmless subject](https://example.invalid/actual-subject)';
+    const text = renderPlanPreview({
+      ...base,
+      plan: {
+        ...base.plan,
+        actions: [
+          action({
+            kind: 'mautic.email.create_draft',
+            platform: 'mautic',
+            target: { level: 'account', id: 'acme-mautic', name: '[Docs](https://example.invalid/name)' },
+            params: { name: 'Offer ~~~~~ `x`', subject, html: '<p>Hi</p>' },
+            before: { note: '![pixel](https://example.invalid/before.png)' },
+            after: { subject },
+            rationale: 'Looks fine ![proof](https://example.invalid/track.png) and [more](https://example.invalid/r) `code`',
+          }),
+        ],
+      },
+    });
+    const lines = text.split('\n');
+    const at = lines.findIndex((line) => line.startsWith('params: '));
+    const fence = '~'.repeat(6);
+    expect(lines.slice(at - 1, at + 4)).toEqual([
+      fence,
+      `params: {"name":"Offer ~~~~~ \`x\`","subject":"${subject}"}`,
+      'before: {"note":"![pixel](https://example.invalid/before.png)"}',
+      `after: {"subject":"${subject}"}`,
+      fence,
+    ]);
+    // Outside the fenced blocks no bracket meets a parenthesis and no backtick survives.
+    let open: string | null = null;
+    const outside = lines.filter((line) => {
+      if (open === null && /^~{4,}$/.test(line)) {
+        open = line;
+        return false;
+      }
+      if (open !== null) {
+        if (line === open) open = null;
+        return false;
+      }
+      return true;
+    });
+    expect(open).toBeNull();
+    expect(outside.join('\n')).not.toMatch(/\]\(|`/);
+    expect(outside).toContain('   entity: account "[Docs] (https://example.invalid/name)" (id "acme-mautic")');
+    expect(outside).toContain(
+      '   rationale: "Looks fine ![proof] (https://example.invalid/track.png) and [more] (https://example.invalid/r) \'code\'"',
+    );
+    expect(outside.some((line) => line.startsWith('params:') || line.startsWith('   before:') || line.startsWith('   after:'))).toBe(false);
   });
 
   it('prints a 20000-character email draft in full', () => {

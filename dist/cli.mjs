@@ -21080,6 +21080,7 @@ function buildSnapshot(input2) {
     datasets: input2.datasets,
     coverage,
     warnings: input2.warnings ?? [],
+    ...input2.conversionDefinition === void 0 ? {} : { conversionDefinition: input2.conversionDefinition },
     contentHash
   };
 }
@@ -23188,7 +23189,9 @@ async function fetchMetaAdsSnapshot(deps, request) {
     datasets,
     coverage,
     warnings,
-    now: deps.now()
+    now: deps.now(),
+    // Absent when no conversion action was found: the conversions are then 0 by construction, not by definition.
+    ...conversionAction === void 0 ? {} : { conversionDefinition: conversionAction }
   });
 }
 
@@ -41856,6 +41859,19 @@ var KPI_KEYS = [
   "conversionRate"
 ];
 var TOP_CAMPAIGNS = 10;
+var CONVERSION_KEYS = /* @__PURE__ */ new Set([
+  "conversions",
+  "conversionValue",
+  "cpa",
+  "roas",
+  "conversionRate"
+]);
+function definitionMismatch(current, previous) {
+  const now = current.conversionDefinition;
+  const before = previous?.conversionDefinition;
+  if (now === void 0 || before === void 0 || now === before) return null;
+  return { current: now, previous: before };
+}
 function totalRows(snapshot2) {
   const rows2 = snapshot2.datasets.campaigns ?? snapshot2.datasets.daily;
   if (rows2 === void 0) {
@@ -41883,13 +41899,13 @@ function comparison(change, previousText) {
   return `, ${change > 0 ? "up" : "down"} ${rounded}% on the previous period (${previousText})`;
 }
 function buildFacts(input2) {
-  const { current, previous, range, currency } = input2;
+  const { current, previous, range, currency, mismatch } = input2;
   const period = `from ${range.start} to ${range.end}`;
   const facts = [];
   const add2 = (label3, verb, key, format) => {
     const value = current[key];
     if (value === null) return;
-    const before = previous === null ? null : previous[key];
+    const before = previous === null || mismatch !== null && CONVERSION_KEYS.has(key) ? null : previous[key];
     const previousText = before === null ? null : format(before);
     facts.push(`${label3} ${verb} ${format(value)} ${period}${comparison(relativeChange(value, before), previousText)}.`);
   };
@@ -41898,6 +41914,11 @@ function buildFacts(input2) {
   add2("CPA", "was", "cpa", (value) => formatMoney(value, currency));
   add2("ROAS", "was", "roas", (value) => value.toFixed(2));
   add2("CTR", "was", "ctr", (value) => formatPercent(value, 2));
+  if (mismatch !== null) {
+    facts.push(
+      `Conversions are not comparable between the two periods: the current period counts "${mismatch.current}", the previous one "${mismatch.previous}". Set META_CONVERSION_ACTION to fix the definition.`
+    );
+  }
   return facts;
 }
 function buildKpiReport(input2) {
@@ -41914,10 +41935,12 @@ function buildKpiReport(input2) {
   }
   const currentKpis = kpis(sumMetrics(totalRows(current)));
   const previousKpis = previous === null ? null : kpis(sumMetrics(totalRows(previous)));
+  const mismatch = definitionMismatch(current, previous);
   const deltas = KPI_KEYS.map((metric2) => {
     const now = currentKpis[metric2];
     const before = previousKpis === null ? null : previousKpis[metric2];
-    return { metric: metric2, current: now, previous: before, change: relativeChange(now, before) };
+    const comparable = mismatch === null || !CONVERSION_KEYS.has(metric2);
+    return { metric: metric2, current: now, previous: before, change: comparable ? relativeChange(now, before) : null };
   });
   const previousById = /* @__PURE__ */ new Map();
   for (const row of previous?.datasets.campaigns ?? []) previousById.set(row.id, row);
@@ -41939,7 +41962,7 @@ function buildKpiReport(input2) {
     previous: previous === null || previousKpis === null ? null : { snapshotId: previous.id, dateRange: previous.dateRange, kpis: previousKpis },
     deltas,
     topCampaigns,
-    facts: buildFacts({ current: currentKpis, previous: previousKpis, range: current.dateRange, currency })
+    facts: buildFacts({ current: currentKpis, previous: previousKpis, range: current.dateRange, currency, mismatch })
   };
 }
 
@@ -42400,7 +42423,7 @@ async function judgeClaims(runtime, input2) {
 // src/report/render.ts
 var MAX_ACCOUNT_TEXT = 80;
 function inert(text5, max) {
-  const flat = text5.replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, " ").replace(/[`"]/g, "'").replace(/\|/g, "/").replace(/ {2,}/g, " ").trim();
+  const flat = text5.replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, " ").replace(/[`"]/g, "'").replace(/\|/g, "/").replace(/\](?=\()/g, "] ").replace(/ {2,}/g, " ").trim();
   const chars = Array.from(flat);
   return chars.length > max ? chars.slice(0, max).join("") : flat;
 }
@@ -42419,16 +42442,18 @@ function fencedBlock(text5) {
   const fence = "~".repeat(Math.max(MIN_FENCE, longest + 1));
   return [fence, ...text5.split("\n").map((line) => visible(line, /[\p{Cc}\p{Cf}\u2028\u2029]/gu)), fence];
 }
-function paramLines(action) {
+function valueLines(action) {
   const html = action.params["html"];
-  if (action.kind !== "mautic.email.create_draft" || typeof html !== "string") {
-    return [`   params: ${literalJson(action.params)}`];
-  }
-  const rest = Object.fromEntries(Object.entries(action.params).filter(([key]) => key !== "html"));
+  const draft2 = action.kind === "mautic.email.create_draft" && typeof html === "string" ? html : null;
+  const params = draft2 === null ? action.params : Object.fromEntries(Object.entries(action.params).filter(([key]) => key !== "html"));
+  const values = [
+    `params: ${literalJson(params)}`,
+    `before: ${action.before === null ? "unknown (could not be read)" : literalJson(action.before)}`,
+    `after: ${literalJson(action.after)}`
+  ];
   return [
-    `   params: ${literalJson(rest)}`,
-    `   html: ${html.length} characters, sha256 ${sha256(html)}`,
-    ...fencedBlock(html)
+    ...fencedBlock(values.join("\n")),
+    ...draft2 === null ? [] : [`   html: ${draft2.length} characters, sha256 ${sha256(draft2)}`, ...fencedBlock(draft2)]
   ];
 }
 function percent(fraction2, decimals) {
@@ -42554,16 +42579,14 @@ function renderPlanPreview(preview2, currency = "XXX") {
     `Plan digest: ${plan2.digest}`
   ];
   plan2.actions.forEach((action, index) => {
-    const delta = action.spendDeltaPerDay === null ? "" : ` (${signedMoney(action.spendDeltaPerDay, currency)} per day)`;
+    const delta = action.spendDeltaPerDay === null ? "" : action.spendDeltaPerDay === 0 ? " (daily budget unchanged)" : ` (${signedMoney(action.spendDeltaPerDay, currency)} per day)`;
     const caution = actionSpec(action.kind).caution;
     lines.push(
       "",
       `${index + 1}. ${action.kind} [${action.id}]`,
       `   entity: ${entityText(action.target)}`,
-      ...paramLines(action),
+      ...valueLines(action),
       ...caution === void 0 ? [] : [`   caution: ${caution}`],
-      `   before: ${action.before === null ? "unknown (could not be read)" : literalJson(action.before)}`,
-      `   after: ${literalJson(action.after)}`,
       `   spend effect: ${action.spendEffect}${delta}`,
       `   reversibility: ${action.reversible}`,
       `   rationale: ${accountText(action.rationale, 400)}`
@@ -43012,6 +43035,16 @@ function snapshotTarget(target, snapshot2) {
     ...typeof source?.adGroupId !== "string" ? {} : { adGroupId: source.adGroupId }
   };
 }
+function accountTarget(account) {
+  return {
+    level: "account",
+    id: account.id,
+    ...typeof account.label !== "string" || account.label === "" ? {} : { name: account.label }
+  };
+}
+function planTarget(target, account, snapshot2) {
+  return target.level === "account" ? accountTarget(account) : snapshotTarget(target, snapshot2);
+}
 function draftsFromFindings(findings, maxActions = DEFAULT_MAX_ACTIONS) {
   const limit = Number.isFinite(maxActions) ? Math.max(0, Math.floor(maxActions)) : DEFAULT_MAX_ACTIONS;
   const ordered = findings.filter((finding) => finding.dataStatus === "sufficient").map((finding, index) => ({ finding, index, monthly: monthlyImpact(finding) })).sort((a, b) => a.monthly === b.monthly ? a.index - b.index : a.monthly > b.monthly ? -1 : 1);
@@ -43038,7 +43071,7 @@ function draftProblems(draft2) {
   if (shape.length > 0) return shape;
   return validateDraft(draft2);
 }
-function writeKeys(draft2) {
+function writeKeys(draft2, account) {
   if (!isRecord9(draft2) || !isRecord9(draft2.target) || !isRecord9(draft2.params) || !isActionKind2(draft2.kind)) return [];
   const spec = actionSpec(draft2.kind);
   let fields;
@@ -43047,7 +43080,8 @@ function writeKeys(draft2) {
   } catch {
     return [];
   }
-  const entity2 = canonicalJson([draft2.target.level, draft2.target.id]);
+  const targetId2 = draft2.target.level === "account" ? account.id : draft2.target.id;
+  const entity2 = canonicalJson([draft2.target.level, targetId2]);
   return fields.map(
     (field2) => CHILD_FIELDS.includes(field2) ? `${entity2}:${field2}:${canonicalJson(draft2.params)}` : `${entity2}:${field2}`
   );
@@ -43077,7 +43111,7 @@ function collectProblems(input2) {
       }
     }
     const clashes = /* @__PURE__ */ new Set();
-    for (const key of writeKeys(draft2)) {
+    for (const key of writeKeys(draft2, input2.account)) {
       const earlier = writers.get(key);
       if (earlier === void 0) writers.set(key, index);
       else clashes.add(earlier);
@@ -43098,7 +43132,7 @@ ${problems.join("\n")}`, {
   }
   const actions = [];
   for (const draft2 of input2.drafts) {
-    const normalized = { ...draft2, target: snapshotTarget(draft2.target, input2.snapshot) };
+    const normalized = { ...draft2, target: planTarget(draft2.target, input2.account, input2.snapshot) };
     const before = await input2.connector.readState(normalized);
     actions.push(buildAction(normalized, before));
   }
@@ -43429,6 +43463,18 @@ function evaluatePolicy(input2) {
       deny("An account budget increase needs a campaigns snapshot.");
       return;
     }
+    const adGroupBudgets = /* @__PURE__ */ new Map();
+    for (const row of snapshot2.datasets.ad_groups ?? []) {
+      if (row.attrs.status !== "ENABLED" || row.campaignId === void 0) continue;
+      const value = row.attrs.dailyBudget;
+      if (value === null || value === void 0) continue;
+      const amount = micros(value);
+      if (amount === null || amount < 0n || typeof value === "number" && value < 0) {
+        deny("An enabled ad group has an invalid daily budget.", { observed: row.id });
+        return;
+      }
+      adGroupBudgets.set(row.campaignId, (adGroupBudgets.get(row.campaignId) ?? 0n) + amount);
+    }
     let total = 0n;
     const countedBudgets = /* @__PURE__ */ new Set();
     for (const row of campaigns) {
@@ -43438,16 +43484,21 @@ function evaluatePolicy(input2) {
         deny("Shared budgets could not be de-duplicated; an enabled campaign is missing its budget id.", { observed: row.id });
         return;
       }
-      const amount = micros(row.attrs.dailyBudget);
-      if (amount === null || amount < 0n || typeof row.attrs.dailyBudget === "number" && row.attrs.dailyBudget < 0) {
+      const value = row.attrs.dailyBudget;
+      const own2 = value === null || value === void 0 ? 0n : micros(value);
+      if (own2 === null || own2 < 0n || typeof value === "number" && value < 0) {
         deny("An enabled campaign has an invalid daily budget.", { observed: row.id });
         return;
+      }
+      if (own2 === 0n) {
+        total += adGroupBudgets.get(row.id) ?? 0n;
+        continue;
       }
       if (budgetId !== null) {
         if (countedBudgets.has(budgetId)) continue;
         countedBudgets.add(budgetId);
       }
-      total += amount;
+      total += own2;
     }
     const limit = cap(total, policy.maxAccountBudgetIncreasePct);
     if (total <= 0n || limit === null || !Number.isFinite(nowMs)) {

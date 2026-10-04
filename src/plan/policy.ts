@@ -346,6 +346,19 @@ export function evaluatePolicy(input: PolicyInput): PolicyDecision {
       deny('An account budget increase needs a campaigns snapshot.');
       return;
     }
+    // A campaign without a budget of its own spends through its enabled ad groups (Meta ad sets).
+    const adGroupBudgets = new Map<string, bigint>();
+    for (const row of snapshot.datasets.ad_groups ?? []) {
+      if (row.attrs.status !== 'ENABLED' || row.campaignId === undefined) continue;
+      const value = row.attrs.dailyBudget;
+      if (value === null || value === undefined) continue;
+      const amount = micros(value);
+      if (amount === null || amount < 0n || (typeof value === 'number' && value < 0)) {
+        deny('An enabled ad group has an invalid daily budget.', { observed: row.id });
+        return;
+      }
+      adGroupBudgets.set(row.campaignId, (adGroupBudgets.get(row.campaignId) ?? 0n) + amount);
+    }
     let total = 0n;
     const countedBudgets = new Set<string>();
     for (const row of campaigns) {
@@ -356,16 +369,21 @@ export function evaluatePolicy(input: PolicyInput): PolicyDecision {
         deny('Shared budgets could not be de-duplicated; an enabled campaign is missing its budget id.', { observed: row.id });
         return;
       }
-      const amount = micros(row.attrs.dailyBudget);
-      if (amount === null || amount < 0n || (typeof row.attrs.dailyBudget === 'number' && row.attrs.dailyBudget < 0)) {
+      const value = row.attrs.dailyBudget;
+      const own = value === null || value === undefined ? 0n : micros(value);
+      if (own === null || own < 0n || (typeof value === 'number' && value < 0)) {
         deny('An enabled campaign has an invalid daily budget.', { observed: row.id });
         return;
+      }
+      if (own === 0n) {
+        total += adGroupBudgets.get(row.id) ?? 0n;
+        continue;
       }
       if (budgetId !== null) {
         if (countedBudgets.has(budgetId)) continue;
         countedBudgets.add(budgetId);
       }
-      total += amount;
+      total += own;
     }
     const limit = cap(total, policy.maxAccountBudgetIncreasePct);
     if (total <= 0n || limit === null || !Number.isFinite(nowMs)) {

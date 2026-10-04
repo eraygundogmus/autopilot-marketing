@@ -374,6 +374,28 @@ describe('fetchMetaAdsSnapshot', () => {
     expect(none.warnings).toContain('No conversion action was found in this period.');
   });
 
+  it('records the chosen conversion action in the snapshot', async () => {
+    const definitionOf = async (actions: string[], env: Env = { META_ACCESS_TOKEN: TOKEN }): Promise<unknown> => {
+      const { http } = fakeHttp({
+        campaigns: [{ id: 'c1', status: 'ACTIVE' }],
+        campaignInsights: [
+          { campaign_id: 'c1', spend: '10', actions: actions.map((type) => ({ action_type: type, value: '2' })) },
+        ],
+      });
+      const deps = makeDeps(http, env);
+      const snapshot = await fetchMetaAdsSnapshot(deps, { account: deps.account, dateRange: RANGE, datasets: ['campaigns'] });
+      if (!('conversionDefinition' in snapshot)) return 'absent';
+      return snapshot.conversionDefinition;
+    };
+    expect(await definitionOf(['lead', 'purchase'])).toBe('purchase');
+    expect(await definitionOf(['lead', 'landing_page_view'])).toBe('lead');
+    expect(await definitionOf(['purchase'], { META_ACCESS_TOKEN: TOKEN, META_CONVERSION_ACTION: ' custom_event ' })).toBe(
+      'custom_event',
+    );
+    expect(await definitionOf(['landing_page_view'])).toBe('absent');
+    expect(await definitionOf([])).toBe('absent');
+  });
+
   it('maps configured statuses and normalises ad sets and ads', async () => {
     const { http } = fakeHttp({
       campaigns: [

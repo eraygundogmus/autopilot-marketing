@@ -661,6 +661,65 @@ describe('evaluatePolicy', () => {
     check(evaluatePolicy(input({ snapshot: data, plan: plan([budget(100, 111)]) })), 'account_budget_increase', 'deny');
   });
 
+  describe('ad set budgets under a campaign without its own budget', () => {
+    const adSet = (id: string, status: string, dailyBudget: number, campaignId = 'campaign-1') =>
+      ({ id, campaignId, metrics: {}, attrs: { status, dailyBudget } });
+    const meta = (adGroups: ReturnType<typeof adSet>[], campaignBudget: number | null = null): Snapshot =>
+      snapshot(0, { platform: 'meta_ads', datasets: {
+        campaigns: [{ id: 'campaign-1', metrics: {}, attrs: { status: 'ENABLED', dailyBudget: campaignBudget } }],
+        ad_groups: adGroups,
+      } });
+    const raise = (after: number): Plan => plan([budget(100, after, {
+      kind: 'meta_ads.adset.set_daily_budget',
+      platform: 'meta_ads',
+      target: { level: 'ad_group', id: 'adset-1', name: 'Ad set', campaignId: 'campaign-1' },
+    })], { platform: 'meta_ads' });
+    const request = (data: Snapshot, after: number, ledger: LedgerEntry[] = []): PolicyInput => input({
+      account: account({ platform: 'meta_ads' }), snapshot: data, plan: raise(after), ledger,
+    });
+    const sets = [adSet('adset-1', 'ENABLED', 100), adSet('adset-2', 'ENABLED', 200)];
+
+    it('allows an increase within the allowance of the enabled ad set total', () => {
+      const decision = evaluatePolicy(request(meta(sets), 105));
+      check(decision, 'account_budget_increase', 'pass');
+      expect(decision.allowed).toBe(true);
+    });
+
+    it('denies an increase that exceeds the allowance with a recent increase from another plan', () => {
+      const earlier = entry(budget(200, 215, {
+        id: 'act_earlier', kind: 'meta_ads.adset.set_daily_budget',
+        target: { level: 'ad_group', id: 'adset-2', campaignId: 'campaign-1' },
+      }), { ts: ago(23) });
+      const decision = evaluatePolicy(request(meta(sets), 120, [earlier]));
+      check(decision, 'account_budget_increase', 'deny');
+      expect(decision.results).toContainEqual(expect.objectContaining({
+        ruleId: 'account_budget_increase', observed: 35, limit: 30,
+      }));
+      check(evaluatePolicy(request(meta(sets), 115, [earlier])), 'account_budget_increase', 'pass');
+    });
+
+    it('does not count paused ad sets or ad sets of other or paused campaigns', () => {
+      const data = meta([
+        adSet('adset-1', 'ENABLED', 100),
+        adSet('adset-2', 'PAUSED', 10_000),
+        adSet('adset-3', 'ENABLED', 10_000, 'campaign-unknown'),
+      ]);
+      check(evaluatePolicy(request(data, 110)), 'account_budget_increase', 'pass');
+      check(evaluatePolicy(request(data, 110.000001)), 'account_budget_increase', 'deny');
+    });
+
+    it('uses the campaign budget alone when the campaign has one', () => {
+      const data = meta(sets, 100);
+      check(evaluatePolicy(request(data, 110)), 'account_budget_increase', 'pass');
+      check(evaluatePolicy(request(data, 110.000001)), 'account_budget_increase', 'deny');
+    });
+
+    it('fails closed when no enabled ad set carries a budget or one is invalid', () => {
+      check(evaluatePolicy(request(meta([adSet('adset-1', 'PAUSED', 100)]), 105)), 'account_budget_increase', 'deny');
+      check(evaluatePolicy(request(meta([...sets, adSet('adset-3', 'ENABLED', Number.NaN)]), 105)), 'account_budget_increase', 'deny');
+    });
+  });
+
   it.each([true, false])('counts a budget id once even when sharedBudget is %s', (sharedBudget) => {
     const data = snapshot(100, { datasets: { campaigns: [
       { id: 'one', metrics: {}, attrs: { status: 'ENABLED', dailyBudget: 100, budgetId: 'budgets/shared', sharedBudget } },

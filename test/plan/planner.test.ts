@@ -362,6 +362,34 @@ describe('createPlan', () => {
     ]);
   });
 
+  it('targets the configured account for an account-level action, whatever id the caller supplied', async () => {
+    const mautic: AccountConfig = { id: 'protected-mautic', platform: 'mautic', externalId: 'm1', label: 'Main list' };
+    const email = (id: string): ActionDraft => ({
+      kind: 'mautic.email.create_draft',
+      target: { level: 'account', id, name: 'Forged name' },
+      params: { name: 'Spring offer', subject: 'A spring offer', html: '<p>Hello</p>' },
+      rationale: 'Draft the reviewed spring email',
+    });
+    const reads: EntityRef[] = [];
+    const connector = {
+      ...fakeConnector({}).connector,
+      readState: (input: ActionDraft) => {
+        reads.push(input.target);
+        return Promise.resolve({});
+      },
+    };
+    const expected = { level: 'account', id: 'protected-mautic', name: 'Main list' };
+    const plan = await createPlan({ ...base([email('anything')], connector), account: mautic });
+    expect(plan.actions[0]?.target).toEqual(expected);
+    expect(reads).toEqual([expected]);
+
+    const unlabelled = await createPlan({ ...base([email('anything')]), account: { ...mautic, id: 'acme-mautic', label: '' } });
+    expect(unlabelled.actions[0]?.target).toEqual({ level: 'account', id: 'acme-mautic' });
+
+    const error = await rejection(createPlan({ ...base([email('one-id'), email('another-id')]), account: mautic }));
+    expect(error.message).toContain('drafts[1]: conflicts with drafts[0]');
+  });
+
   it('lets a connector error propagate', async () => {
     const failure = new AutopilotError('not_found', 'Campaign c2 does not exist');
     const { connector, reads } = fakeConnector({ c1: { status: 'ENABLED', dailyBudget: 40 }, c2: failure });

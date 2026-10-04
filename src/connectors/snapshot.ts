@@ -14,6 +14,7 @@ export function buildSnapshot(input: {
   datasets: Partial<Record<DatasetName, Row[]>>;
   coverage?: Partial<Record<DatasetName, DatasetCoverage>>;
   warnings?: string[];
+  conversionDefinition?: string;
   now: Date;
 }): Snapshot {
   const coverage: Partial<Record<DatasetName, DatasetCoverage>> = { ...input.coverage };
@@ -41,6 +42,7 @@ export function buildSnapshot(input: {
     datasets: input.datasets,
     coverage,
     warnings: input.warnings ?? [],
+    ...(input.conversionDefinition === undefined ? {} : { conversionDefinition: input.conversionDefinition }),
     contentHash,
   };
 }
