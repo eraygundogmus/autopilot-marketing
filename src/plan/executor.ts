@@ -507,12 +507,14 @@ export async function applyPlan(planId: string, runtime: Runtime, options: Apply
         let result: ActionResult;
         let ambiguous = false;
         let guardThrew = false;
+        let dispatchBegan = false;
         const beforeWrite = () => {
-          const blocked = writeStopReason();
+          const blocked = stopReason() ?? writeStopReason();
           if (blocked !== null) {
             guardThrew = true;
             throw new AutopilotError('stale_state', blocked);
           }
+          dispatchBegan = true;
         };
         // A dispatched mutation remains unknown until a result or a fresh read settles it.
         action.status = 'unknown';
@@ -526,7 +528,9 @@ export async function applyPlan(planId: string, runtime: Runtime, options: Apply
             break;
           }
           result = failedResult(error, runtime);
-          ambiguous = true;
+          // Connector has no implementation marker: every connector must call beforeWrite
+          // before each mutating request, as required by Connector.apply's contract.
+          ambiguous = dispatchBegan;
         }
 
         if (result.ok) {

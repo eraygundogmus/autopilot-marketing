@@ -20193,6 +20193,54 @@ var MAX_RETRY_AFTER_MS = 3e4;
 var MAX_BACKOFF_MS = 8e3;
 var ERROR_BODY_CHARS = 300;
 var ERROR_DETAIL_CHARS = 4e3;
+var MIN_SECRET_CHARS = 6;
+var REDACTED = "[redacted]";
+var SECRET_FIELDS = /* @__PURE__ */ new Set([
+  "access_token",
+  "refresh_token",
+  "client_secret",
+  "password",
+  "api_key",
+  "key",
+  "token",
+  "code",
+  "assertion"
+]);
+function requestSecrets(url2, headers, form) {
+  const found = /* @__PURE__ */ new Set();
+  const add3 = (value) => {
+    found.add(value);
+    found.add(encodeURIComponent(value));
+    found.add(new URLSearchParams({ v: value }).toString().slice(2));
+  };
+  for (const [name, raw] of Object.entries(headers)) {
+    if (name.toLowerCase() !== "authorization") continue;
+    const value = raw.trim();
+    add3(value);
+    const match = /^(\S+)\s+(.+)$/.exec(value);
+    if (match === null) continue;
+    const scheme = match[1] ?? "";
+    const credential = match[2] ?? "";
+    add3(credential);
+    if (scheme.toLowerCase() !== "basic") continue;
+    const decoded = Buffer.from(credential, "base64").toString("utf8");
+    add3(decoded);
+    const colon = decoded.indexOf(":");
+    if (colon >= 0) add3(decoded.slice(colon + 1));
+  }
+  for (const [name, value] of url2.searchParams) {
+    if (SECRET_FIELDS.has(name.toLowerCase())) add3(value);
+  }
+  for (const [name, value] of Object.entries(form ?? {})) {
+    if (SECRET_FIELDS.has(name.toLowerCase())) add3(value);
+  }
+  return [...found].filter((value) => value.length >= MIN_SECRET_CHARS).sort((a, b) => b.length - a.length);
+}
+function scrub(text8, secrets) {
+  let out = text8;
+  for (const secret of secrets) out = out.split(secret).join(REDACTED);
+  return out;
+}
 function defaultSleep(ms) {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
@@ -20215,7 +20263,7 @@ function createHttpClient(options = {}) {
   const sleep3 = options.sleep ?? defaultSleep;
   const maxAttempts = Math.max(1, Math.floor(options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS));
   const clean = (text8) => options.env === void 0 ? redact(text8) : redact(text8, options.env);
-  async function attemptOnce(url2, where, method, headers, body, timeoutMs) {
+  async function attemptOnce(url2, where, method, headers, body, timeoutMs, secrets) {
     const controller = new AbortController();
     let timedOut = false;
     const timer = setTimeout(() => {
@@ -20232,7 +20280,7 @@ function createHttpClient(options = {}) {
         resHeaders[key.toLowerCase()] = value;
       });
       if (res.status < 200 || res.status >= 300) {
-        const cleaned = clean(text8);
+        const cleaned = clean(scrub(text8, secrets));
         const message = `${where} -> ${res.status}: ${cleaned.slice(0, ERROR_BODY_CHARS)}`;
         const wait = retryAfterMs(resHeaders["retry-after"]);
         const details = { status: res.status, body: cleaned.slice(0, ERROR_DETAIL_CHARS) };
@@ -20279,11 +20327,12 @@ function createHttpClient(options = {}) {
       if (!hasHeader(headers, "content-type")) headers["Content-Type"] = "application/x-www-form-urlencoded";
     }
     const method = req.method ?? (body === void 0 ? "GET" : "POST");
-    const where = `${method} ${url2.origin}${url2.pathname}`;
+    const secrets = requestSecrets(url2, headers, req.form);
+    const where = scrub(`${method} ${url2.origin}${url2.pathname}`, secrets);
     const attempts = req.retry ?? method === "GET" ? maxAttempts : 1;
     const timeoutMs = req.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     for (let attempt = 1; ; attempt += 1) {
-      const result = await attemptOnce(url2, where, method, headers, body, timeoutMs);
+      const result = await attemptOnce(url2, where, method, headers, body, timeoutMs, secrets);
       if (result.response !== void 0) return result.response;
       const error62 = result.error ?? new AutopilotError("internal", `${where}: no response`);
       if (!error62.retryable || attempt >= attempts) throw error62;
@@ -21453,28 +21502,39 @@ function envValue(env, name) {
   const value = env[name];
   return typeof value === "string" && value !== "" ? value : void 0;
 }
-function resolveRefreshVars(env, account) {
-  const read = (prefix2) => REFRESH_VARS.map(([name, alias]) => {
-    if (credentialUnavailable(env, prefix2 + name)) return void 0;
-    const canonical = envValue(env, prefix2 + name);
-    if (canonical !== void 0) return canonical;
-    return credentialUnavailable(env, prefix2 + alias) ? void 0 : envValue(env, prefix2 + alias);
-  });
+function resolveGoogleCredentials(env, account) {
+  const read = (prefix2) => {
+    const unavailable2 = [];
+    const refresh = REFRESH_VARS.map(([name, alias]) => {
+      if (!credentialUnavailable(env, prefix2 + name)) {
+        const canonical = envValue(env, prefix2 + name);
+        if (canonical !== void 0) return canonical;
+        if (!credentialUnavailable(env, prefix2 + alias)) return envValue(env, prefix2 + alias);
+      }
+      unavailable2.push(prefix2 + name);
+      return void 0;
+    });
+    const fileUnavailable = credentialUnavailable(env, prefix2 + CREDENTIALS_VAR);
+    if (fileUnavailable) unavailable2.push(prefix2 + CREDENTIALS_VAR);
+    const credentialsFile = fileUnavailable ? void 0 : envValue(env, prefix2 + CREDENTIALS_VAR);
+    return { prefix: prefix2, refresh, credentialsFile, unavailable: unavailable2 };
+  };
   const prefix = account.envPrefix ?? "";
   if (prefix !== "") {
-    const values = read(prefix);
-    const claimed = values.some((value) => value !== void 0) || REFRESH_VARS.some((names) => names.some((name) => credentialUnavailable(env, prefix + name)));
-    if (claimed) return { prefix, values };
+    const scoped = read(prefix);
+    const claimed = scoped.unavailable.length > 0 || scoped.credentialsFile !== void 0 || scoped.refresh.some((value) => value !== void 0) || REFRESH_VARS.some(([, alias]) => credentialUnavailable(env, prefix + alias));
+    if (claimed) return scoped;
   }
-  return { prefix: "", values: read("") };
+  return read("");
 }
 function googleAuthMissing(env, account) {
-  if (envFor(env, account, CREDENTIALS_VAR) !== void 0) return [];
-  const { prefix, values } = resolveRefreshVars(env, account);
+  const { prefix, refresh, credentialsFile, unavailable: unavailable2 } = resolveGoogleCredentials(env, account);
+  if (unavailable2.length === 0 && credentialsFile !== void 0) return [];
   const missing = [];
   REFRESH_VARS.forEach(([name], index) => {
-    if (values[index] === void 0) missing.push(prefix + name);
+    if (refresh[index] === void 0) missing.push(prefix + name);
   });
+  if (unavailable2.includes(prefix + CREDENTIALS_VAR)) missing.push(prefix + CREDENTIALS_VAR);
   return missing;
 }
 function cacheKey(flow, identity, scopes) {
@@ -21543,8 +21603,10 @@ async function requestToken(http, url2, form, now) {
 }
 async function getGoogleAccessToken(options) {
   const { env, account, http, scopes, now } = options;
-  const [clientId, clientSecret, refreshToken] = resolveRefreshVars(env, account).values;
-  const credentialsFile = envFor(env, account, CREDENTIALS_VAR);
+  const resolved3 = resolveGoogleCredentials(env, account);
+  const usable = resolved3.unavailable.length === 0;
+  const [clientId, clientSecret, refreshToken] = usable ? resolved3.refresh : [];
+  const credentialsFile = usable ? resolved3.credentialsFile : void 0;
   let key;
   let fetchToken;
   if (clientId !== void 0 && clientSecret !== void 0 && refreshToken !== void 0) {
@@ -21576,7 +21638,7 @@ ${serviceKey.tokenUri}`, scopes);
     );
   } else {
     const names = REFRESH_VARS.map(([name]) => name);
-    const prefix = account.envPrefix ?? "";
+    const prefix = resolved3.prefix;
     throw new AutopilotError("not_configured", `Google credentials are not configured for account '${account.id}'.`, {
       hint: `Set ${names.map((name) => prefix + name).join(", ")} (missing: ${googleAuthMissing(env, account).join(", ")}), or set ${prefix}${CREDENTIALS_VAR} to a service-account key file.`
     });
@@ -21619,16 +21681,37 @@ function bool(value) {
   if (value === 0 || value === "0") return false;
   return null;
 }
+var AUTH_NAMES = ["MAUTIC_CLIENT_ID", "MAUTIC_CLIENT_SECRET", "MAUTIC_USERNAME", "MAUTIC_PASSWORD"];
+function authScope(deps) {
+  const { env, account } = deps;
+  const read = (name) => {
+    const value = env[name];
+    return typeof value === "string" && value !== "" ? value : void 0;
+  };
+  const prefix = account.envPrefix ?? "";
+  const own2 = prefix !== "" && AUTH_NAMES.some((name) => read(prefix + name) !== void 0 || credentialUnavailable(env, prefix + name));
+  const scope = own2 ? prefix : "";
+  const unavailable2 = AUTH_NAMES.map((name) => scope + name).filter((name) => credentialUnavailable(env, name));
+  const values = {};
+  if (unavailable2.length > 0) return { unavailable: unavailable2, values };
+  for (const name of AUTH_NAMES) {
+    const value = read(scope + name);
+    if (value !== void 0) values[name] = value;
+  }
+  return { unavailable: unavailable2, values };
+}
 function mauticAuthMissing(deps) {
-  const has2 = (name) => envFor(deps.env, deps.account, name) !== void 0;
-  if (has2("MAUTIC_CLIENT_ID") && has2("MAUTIC_CLIENT_SECRET")) return [];
-  if (has2("MAUTIC_USERNAME") && has2("MAUTIC_PASSWORD")) return [];
+  const { unavailable: unavailable2, values } = authScope(deps);
+  if (unavailable2.length > 0) return unavailable2;
+  if (values.MAUTIC_CLIENT_ID !== void 0 && values.MAUTIC_CLIENT_SECRET !== void 0) return [];
+  if (values.MAUTIC_USERNAME !== void 0 && values.MAUTIC_PASSWORD !== void 0) return [];
   return ["MAUTIC_CLIENT_ID", "MAUTIC_CLIENT_SECRET"];
 }
 async function authorization(deps) {
-  const { env, account } = deps;
-  const clientId = envFor(env, account, "MAUTIC_CLIENT_ID");
-  const clientSecret = envFor(env, account, "MAUTIC_CLIENT_SECRET");
+  const { account } = deps;
+  const { unavailable: unavailable2, values } = authScope(deps);
+  const clientId = values.MAUTIC_CLIENT_ID;
+  const clientSecret = values.MAUTIC_CLIENT_SECRET;
   if (clientId !== void 0 && clientSecret !== void 0) {
     const base = baseUrl(deps);
     const key = `${base}
@@ -21652,8 +21735,8 @@ ${clientId}`;
     tokenCache.set(key, { token, usableUntil: nowMs + expiresIn * 1e3 - TOKEN_SAFETY_MS });
     return `Bearer ${token}`;
   }
-  const username = envFor(env, account, "MAUTIC_USERNAME");
-  const password = envFor(env, account, "MAUTIC_PASSWORD");
+  const username = values.MAUTIC_USERNAME;
+  const password = values.MAUTIC_PASSWORD;
   if (username !== void 0 && password !== void 0) {
     return `Basic ${Buffer.from(`${username}:${password}`, "utf8").toString("base64")}`;
   }
@@ -21661,7 +21744,7 @@ ${clientId}`;
     "not_configured",
     `Mautic credentials are missing for account '${account.id}': set MAUTIC_CLIENT_ID and MAUTIC_CLIENT_SECRET, or MAUTIC_USERNAME and MAUTIC_PASSWORD`,
     {
-      hint: account.envPrefix !== void 0 && account.envPrefix !== "" ? `Variables may carry the account prefix '${account.envPrefix}'.` : "Add them to the .env file in the autopilot home directory."
+      hint: unavailable2.length > 0 ? `The credential store could not be read for: ${unavailable2.join(", ")}. No other credentials are used in their place.` : account.envPrefix !== void 0 && account.envPrefix !== "" ? `Variables may carry the account prefix '${account.envPrefix}'.` : "Add them to the .env file in the autopilot home directory."
     }
   );
 }
@@ -25400,9 +25483,13 @@ function defaultSleep2(ms) {
     setTimeout(resolve, ms);
   });
 }
+function apiKey(env) {
+  if (credentialUnavailable(env, "TYPESAFE_API_KEY") || credentialUnavailable(env, "TYPESAFE_AI_KEY")) return "";
+  return env.TYPESAFE_API_KEY || env.TYPESAFE_AI_KEY || "";
+}
 function createTypeSafeClient(options) {
   const { config: config2 } = options;
-  const key = options.env.TYPESAFE_API_KEY || options.env.TYPESAFE_AI_KEY || "";
+  const key = apiKey(options.env);
   const available = key.length > 0;
   const maxAttempts = Math.max(1, options.maxAttempts ?? 5);
   const timeoutMs = options.timeoutMs ?? 6e4;
@@ -26016,14 +26103,23 @@ var LOCK_RETRY_MS = 25;
 function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
+function readLockToken(lockPath) {
+  try {
+    return fs5.readFileSync(lockPath, "utf8");
+  } catch {
+    return void 0;
+  }
+}
 function withIndexLock(paths, options, run2) {
   const lockPath = `${paths.credentials}.lock`;
   const timeoutMs = options.timeoutMs ?? LOCK_TIMEOUT_MS;
   const staleMs = options.staleMs ?? LOCK_STALE_MS;
+  const token = randomBytes2(8).toString("hex");
   fs5.mkdirSync(path4.dirname(lockPath), { recursive: true });
   const deadline = Date.now() + timeoutMs;
-  let fd;
-  while (fd === void 0) {
+  let held = false;
+  while (!held) {
+    let fd;
     try {
       fd = fs5.openSync(lockPath, "wx", 384);
     } catch (error62) {
@@ -26033,6 +26129,7 @@ function withIndexLock(paths, options, run2) {
           cause: error62
         });
       }
+      const seen = readLockToken(lockPath);
       let ageMs;
       try {
         ageMs = Date.now() - fs5.statSync(lockPath).mtimeMs;
@@ -26040,7 +26137,7 @@ function withIndexLock(paths, options, run2) {
         continue;
       }
       if (ageMs > staleMs) {
-        fs5.rmSync(lockPath, { force: true });
+        if (seen !== void 0 && readLockToken(lockPath) === seen) fs5.rmSync(lockPath, { force: true });
         continue;
       }
       if (Date.now() >= deadline) {
@@ -26049,22 +26146,39 @@ function withIndexLock(paths, options, run2) {
         });
       }
       sleepSync(LOCK_RETRY_MS);
+      continue;
     }
+    try {
+      fs5.writeSync(fd, token);
+    } finally {
+      fs5.closeSync(fd);
+    }
+    held = true;
   }
+  const assertOwned = () => {
+    if (readLockToken(lockPath) !== token) {
+      throw new AutopilotError(
+        "stale_state",
+        "The credential index lock was taken over by another process; nothing was written.",
+        { retryable: true }
+      );
+    }
+  };
   try {
-    return run2();
+    return run2(assertOwned);
   } finally {
-    fs5.closeSync(fd);
-    fs5.rmSync(lockPath, { force: true });
+    if (readLockToken(lockPath) === token) fs5.rmSync(lockPath, { force: true });
   }
 }
 function newCredentialIndex() {
   return { profile: randomBytes2(4).toString("hex"), names: [] };
 }
 function updateCredentialIndex(paths, mutate, options = {}) {
-  return withIndexLock(paths, options, () => {
+  return withIndexLock(paths, options, (assertOwned) => {
     const current = readCredentialIndex(paths) ?? newCredentialIndex();
     const next = { profile: current.profile, names: [...new Set(mutate([...current.names]))].sort() };
+    options.beforeWrite?.();
+    assertOwned();
     writeCredentialIndex(paths, next);
     return next;
   });
@@ -26072,10 +26186,12 @@ function updateCredentialIndex(paths, mutate, options = {}) {
 function ensureCredentialIndex(paths, options = {}) {
   const existing = readCredentialIndex(paths);
   if (existing !== null) return existing;
-  return withIndexLock(paths, options, () => {
+  return withIndexLock(paths, options, (assertOwned) => {
     const raced = readCredentialIndex(paths);
     if (raced !== null) return raced;
     const created = newCredentialIndex();
+    options.beforeWrite?.();
+    assertOwned();
     writeCredentialIndex(paths, created);
     return created;
   });
@@ -45485,12 +45601,14 @@ async function applyPlan(planId, runtime, options) {
         let result;
         let ambiguous = false;
         let guardThrew = false;
+        let dispatchBegan = false;
         const beforeWrite = () => {
-          const blocked = writeStopReason();
+          const blocked = stopReason() ?? writeStopReason();
           if (blocked !== null) {
             guardThrew = true;
             throw new AutopilotError("stale_state", blocked);
           }
+          dispatchBegan = true;
         };
         action.status = "unknown";
         delete action.result;
@@ -45503,7 +45621,7 @@ async function applyPlan(planId, runtime, options) {
             break;
           }
           result = failedResult(error63, runtime);
-          ambiguous = true;
+          ambiguous = dispatchBegan;
         }
         if (result.ok) {
           let observed2 = null;
@@ -46098,6 +46216,7 @@ var MAX_ATTEMPTS = 3;
 var MAX_ERROR_CHARS2 = 300;
 var MAX_SUMMARY_CHARS = 200;
 var DEFAULT_DAYS = 30;
+var SUPERSEDE_LOOKBACK = 50;
 function errorMessage(error62) {
   return error62 instanceof Error ? error62.message : String(error62);
 }
@@ -46156,11 +46275,11 @@ function obsoleteReason(runtime, job) {
   if (fingerprintOf(runtime, schedule2)?.fingerprint !== job.input.fingerprint) {
     return "the schedule changed after this run was queued";
   }
-  const latest = runtime.jobs.latest(job.scheduleId);
-  if (latest && latest.id !== job.id && Date.parse(latest.dueAt) > Date.parse(job.dueAt)) {
-    return "a newer run of this schedule replaced it";
-  }
-  return null;
+  const dueMs = Date.parse(job.dueAt);
+  const superseded = runtime.jobs.list({ scheduleId: job.scheduleId, limit: SUPERSEDE_LOOKBACK }).some(
+    (other) => other.id !== job.id && other.input.fingerprint === job.input.fingerprint && Date.parse(other.dueAt) > dueMs
+  );
+  return superseded ? "a newer run of this schedule replaced it" : null;
 }
 function auditSummary(audit2) {
   const score3 = audit2.score.value;
@@ -46293,7 +46412,7 @@ async function runDue(runtime, options = {}) {
       );
     }
   }
-  const ran = reclaimedJobs.map((job) => runtime.jobs.get(job.id)).filter((job) => job.state === "failed");
+  const ran = reclaimedJobs.filter((job) => job.state === "failed");
   for (let claimed = 0; claimed < maxJobs; claimed += 1) {
     const job = runtime.jobs.claimDue(workerId, runtime.now(), CLAIM_TTL_SECONDS);
     if (!job) break;
@@ -62594,9 +62713,9 @@ async function watch(ctx, intervalSeconds) {
       try {
         const runtime = ctx.signal === void 0 ? createRuntime() : ctx.runtime;
         const result = await runPass(runtime);
-        if (result.enqueued.length > 0 || result.ran.length > 0) {
+        if (result.enqueued.length > 0 || result.ran.length > 0 || result.notes.length > 0) {
           ctx.io.stdout(ctx.json ? `${JSON.stringify(result)}
-` : `${passHeadline(result)}
+` : `${passText(result)}
 `);
         }
       } catch (error62) {
@@ -62751,12 +62870,13 @@ var agent = async (ctx) => {
     throw usage("agent", "No model was chosen.", "Pass --model, for example --model qwen3 with Ollama.");
   }
   const baseUrl2 = stringFlag2(ctx, "agent", "base-url") || runtime.env.AUTOPILOT_AGENT_BASE_URL || runtime.config.agent?.baseUrl || DEFAULT_BASE_URL;
-  const apiKey = runtime.env.AUTOPILOT_AGENT_API_KEY;
-  const maxSteps = intFlag2(ctx, "agent", "max-steps");
-  if (maxSteps !== void 0 && maxSteps < 1) throw usage("agent", "--max-steps must be at least 1.");
+  const apiKey2 = runtime.env.AUTOPILOT_AGENT_API_KEY;
+  const maxStepsFlag = intFlag2(ctx, "agent", "max-steps");
+  if (maxStepsFlag !== void 0 && maxStepsFlag < 1) throw usage("agent", "--max-steps must be at least 1.");
+  const maxSteps = maxStepsFlag ?? runtime.config.agent?.maxSteps;
   const allowRemote = ctx.flags["allow-remote"] === true;
   const accounts = listFlag(ctx, "agent", "account");
-  const chat = ctx.chat ?? createChatClient({ baseUrl: baseUrl2, ...apiKey === void 0 || apiKey === "" ? {} : { apiKey }, allowRemote });
+  const chat = ctx.chat ?? createChatClient({ baseUrl: baseUrl2, ...apiKey2 === void 0 || apiKey2 === "" ? {} : { apiKey: apiKey2 }, allowRemote });
   if (!allowRemote && (await chat.remoteModels()).includes(model)) {
     throw new AutopilotError("invalid_input", `Model ${oneLine(model)} is served from another machine by this endpoint.`, {
       hint: "Choose a local model, or pass --allow-remote."

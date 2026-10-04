@@ -126,8 +126,10 @@ async function watch(ctx: CommandContext, intervalSeconds: number): Promise<numb
         // A fresh runtime per pass picks up edits of the config file; tests keep their own runtime.
         const runtime = ctx.signal === undefined ? createRuntime() : ctx.runtime;
         const result = await runPass(runtime);
-        if (result.enqueued.length > 0 || result.ran.length > 0) {
-          ctx.io.stdout(ctx.json ? `${JSON.stringify(result)}\n` : `${passHeadline(result)}\n`);
+        // A pass that did something, or that has something for the person, is printed in full:
+        // a failed run and what reconciliation found must not shrink to a count.
+        if (result.enqueued.length > 0 || result.ran.length > 0 || result.notes.length > 0) {
+          ctx.io.stdout(ctx.json ? `${JSON.stringify(result)}\n` : `${passText(result)}\n`);
         }
       } catch (error) {
         // One bad pass (a config file caught mid-edit, say) must not end the loop.
@@ -298,8 +300,9 @@ const agent: CommandHandler = async (ctx) => {
     runtime.config.agent?.baseUrl ||
     DEFAULT_BASE_URL;
   const apiKey = runtime.env.AUTOPILOT_AGENT_API_KEY;
-  const maxSteps = intFlag(ctx, 'agent', 'max-steps');
-  if (maxSteps !== undefined && maxSteps < 1) throw usage('agent', '--max-steps must be at least 1.');
+  const maxStepsFlag = intFlag(ctx, 'agent', 'max-steps');
+  if (maxStepsFlag !== undefined && maxStepsFlag < 1) throw usage('agent', '--max-steps must be at least 1.');
+  const maxSteps = maxStepsFlag ?? runtime.config.agent?.maxSteps;
   const allowRemote = ctx.flags['allow-remote'] === true;
   const accounts = listFlag(ctx, 'agent', 'account');
 

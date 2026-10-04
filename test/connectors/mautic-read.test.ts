@@ -1,4 +1,8 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createMauticConnector } from '../../src/connectors/mautic';
 import {
@@ -7,7 +11,9 @@ import {
   mauticAuthMissing,
   mauticRequest,
 } from '../../src/connectors/mautic-read';
+import { loadEnv } from '../../src/core/env';
 import { AutopilotError } from '../../src/core/errors';
+import { resolvePaths } from '../../src/core/paths';
 import type {
   AccountConfig,
   ConnectorDeps,
@@ -297,6 +303,77 @@ describe('fetchMauticSnapshot', () => {
       code: 'not_configured',
     });
     expect(calls).toHaveLength(0);
+  });
+});
+
+describe('unreadable credentials', () => {
+  let home: string;
+
+  beforeEach(() => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'autopilot-mautic-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  const stored = (values: Env, blocked: string[]): Env =>
+    loadEnv(resolvePaths({ AUTOPILOT_HOME: home }), {}, { values, blocked });
+
+  it('does not use the global identity when the prefixed secret is unreadable', async () => {
+    const env = stored({ ...BASIC, ...OAUTH, ACME_MAUTIC_CLIENT_ID: 'own' }, ['ACME_MAUTIC_CLIENT_SECRET']);
+    const { deps, calls, account } = setup({ env, account: { envPrefix: 'ACME_' }, handler: standard() });
+
+    expect(mauticAuthMissing(deps)).toEqual(['ACME_MAUTIC_CLIENT_SECRET']);
+    const error = await mauticRequest(deps, '/emails').catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(AutopilotError);
+    expect((error as AutopilotError).code).toBe('not_configured');
+    expect((error as AutopilotError).hint).toContain('ACME_MAUTIC_CLIENT_SECRET');
+    await expect(fetchMauticSnapshot(deps, { account, dateRange: RANGE })).rejects.toMatchObject({
+      code: 'not_configured',
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('does not use the prefixed Basic pair when a prefixed OAuth name is unreadable', async () => {
+    const env = stored({ ACME_MAUTIC_USERNAME: 'ada', ACME_MAUTIC_PASSWORD: 'pw' }, ['ACME_MAUTIC_CLIENT_SECRET']);
+    const { deps, calls } = setup({ env, account: { envPrefix: 'ACME_' } });
+    expect(mauticAuthMissing(deps)).toEqual(['ACME_MAUTIC_CLIENT_SECRET']);
+    await expect(mauticRequest(deps, '/emails')).rejects.toMatchObject({ code: 'not_configured' });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('does not complete a prefixed client id with a global secret', async () => {
+    const { deps, calls } = setup({
+      env: { ACME_MAUTIC_CLIENT_ID: 'own', MAUTIC_CLIENT_SECRET: 'sec', ...BASIC },
+      account: { envPrefix: 'ACME_' },
+    });
+    expect(mauticAuthMissing(deps)).toEqual(['MAUTIC_CLIENT_ID', 'MAUTIC_CLIENT_SECRET']);
+    await expect(mauticRequest(deps, '/emails')).rejects.toMatchObject({ code: 'not_configured' });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('uses the global names for a prefixed account that has no prefixed name', async () => {
+    const { deps } = setup({ env: stored(BASIC, []), account: { envPrefix: 'ACME_' } });
+    expect(mauticAuthMissing(deps)).toEqual([]);
+    const request = await mauticRequest(deps, '/emails');
+    expect(request.headers?.['Authorization']).toBe(`Basic ${Buffer.from('ada:pw').toString('base64')}`);
+  });
+
+  it('leaves an account without prefix unconfigured when a global name is unreadable', async () => {
+    const env = stored({ ...OAUTH, MAUTIC_USERNAME: 'ada' }, ['MAUTIC_PASSWORD']);
+    const { deps, calls } = setup({ env });
+    expect(mauticAuthMissing(deps)).toEqual(['MAUTIC_PASSWORD']);
+    await expect(mauticRequest(deps, '/emails')).rejects.toMatchObject({ code: 'not_configured' });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('ignores an unreadable global name once the account has its own complete pair', async () => {
+    const env = stored({ ACME_MAUTIC_USERNAME: 'ada', ACME_MAUTIC_PASSWORD: 'pw' }, ['MAUTIC_CLIENT_SECRET']);
+    const { deps } = setup({ env, account: { envPrefix: 'ACME_' } });
+    expect(mauticAuthMissing(deps)).toEqual([]);
+    const request = await mauticRequest(deps, '/emails');
+    expect(request.headers?.['Authorization']).toBe(`Basic ${Buffer.from('ada:pw').toString('base64')}`);
   });
 });
 

@@ -18,6 +18,64 @@ const MAX_BACKOFF_MS = 8_000;
 const ERROR_BODY_CHARS = 300;
 const ERROR_DETAIL_CHARS = 4000;
 
+const MIN_SECRET_CHARS = 6;
+const REDACTED = '[redacted]';
+const SECRET_FIELDS = new Set([
+  'access_token',
+  'refresh_token',
+  'client_secret',
+  'password',
+  'api_key',
+  'key',
+  'token',
+  'code',
+  'assertion',
+]);
+
+/**
+ * The credentials one request carries, longest first so that a value containing another is replaced
+ * whole. Values shorter than MIN_SECRET_CHARS are left out: they would match ordinary text.
+ */
+function requestSecrets(url: URL, headers: Record<string, string>, form: Record<string, string> | undefined): string[] {
+  const found = new Set<string>();
+  const add = (value: string): void => {
+    found.add(value);
+    // A platform may echo the value as it travelled on the wire.
+    found.add(encodeURIComponent(value));
+    found.add(new URLSearchParams({ v: value }).toString().slice(2));
+  };
+
+  for (const [name, raw] of Object.entries(headers)) {
+    if (name.toLowerCase() !== 'authorization') continue;
+    const value = raw.trim();
+    add(value);
+    const match = /^(\S+)\s+(.+)$/.exec(value);
+    if (match === null) continue;
+    const scheme = match[1] ?? '';
+    const credential = match[2] ?? '';
+    add(credential);
+    if (scheme.toLowerCase() !== 'basic') continue;
+    const decoded = Buffer.from(credential, 'base64').toString('utf8');
+    add(decoded);
+    const colon = decoded.indexOf(':');
+    if (colon >= 0) add(decoded.slice(colon + 1));
+  }
+  for (const [name, value] of url.searchParams) {
+    if (SECRET_FIELDS.has(name.toLowerCase())) add(value);
+  }
+  for (const [name, value] of Object.entries(form ?? {})) {
+    if (SECRET_FIELDS.has(name.toLowerCase())) add(value);
+  }
+
+  return [...found].filter((value) => value.length >= MIN_SECRET_CHARS).sort((a, b) => b.length - a.length);
+}
+
+function scrub(text: string, secrets: readonly string[]): string {
+  let out = text;
+  for (const secret of secrets) out = out.split(secret).join(REDACTED);
+  return out;
+}
+
 interface Attempt {
   response?: HttpResponse<unknown>;
   error?: AutopilotError;
@@ -60,6 +118,7 @@ export function createHttpClient(options: HttpOptions = {}): HttpClient {
     headers: Record<string, string>,
     body: string | undefined,
     timeoutMs: number,
+    secrets: readonly string[],
   ): Promise<Attempt> {
     const controller = new AbortController();
     let timedOut = false;
@@ -79,7 +138,8 @@ export function createHttpClient(options: HttpOptions = {}): HttpClient {
 
       if (res.status < 200 || res.status >= 300) {
         // Redaction sees the whole body: a secret cut by truncation would no longer be recognised.
-        const cleaned = clean(text);
+        // The request's own credentials go first: one issued at run time is not in the environment.
+        const cleaned = clean(scrub(text, secrets));
         const message = `${where} -> ${res.status}: ${cleaned.slice(0, ERROR_BODY_CHARS)}`;
         const wait = retryAfterMs(resHeaders['retry-after']);
         // The message stays short; the longer body is for code that classifies the failure.
@@ -137,12 +197,14 @@ export function createHttpClient(options: HttpOptions = {}): HttpClient {
     }
 
     const method = req.method ?? (body === undefined ? 'GET' : 'POST');
-    const where = `${method} ${url.origin}${url.pathname}`;
+    const secrets = requestSecrets(url, headers, req.form);
+    // No query string, and no credential of this request, ever reaches a message.
+    const where = scrub(`${method} ${url.origin}${url.pathname}`, secrets);
     const attempts = (req.retry ?? method === 'GET') ? maxAttempts : 1;
     const timeoutMs = req.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
     for (let attempt = 1; ; attempt += 1) {
-      const result = await attemptOnce(url, where, method, headers, body, timeoutMs);
+      const result = await attemptOnce(url, where, method, headers, body, timeoutMs, secrets);
       if (result.response !== undefined) return result.response as HttpResponse<T>;
       const error = result.error ?? new AutopilotError('internal', `${where}: no response`);
       if (!error.retryable || attempt >= attempts) throw error;

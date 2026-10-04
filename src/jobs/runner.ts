@@ -48,6 +48,7 @@ const MAX_ATTEMPTS = 3;
 const MAX_ERROR_CHARS = 300;
 const MAX_SUMMARY_CHARS = 200;
 const DEFAULT_DAYS = 30;
+const SUPERSEDE_LOOKBACK = 50;
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -113,11 +114,16 @@ function obsoleteReason(runtime: Runtime, job: Job): string | null {
   if (fingerprintOf(runtime, schedule)?.fingerprint !== job.input.fingerprint) {
     return 'the schedule changed after this run was queued';
   }
-  const latest = runtime.jobs.latest(job.scheduleId);
-  if (latest && latest.id !== job.id && Date.parse(latest.dueAt) > Date.parse(job.dueAt)) {
-    return 'a newer run of this schedule replaced it';
-  }
-  return null;
+  // Only a later job queued under the schedule's present fingerprint supersedes this one: a job of
+  // an earlier definition is obsolete itself, whatever its slot.
+  const dueMs = Date.parse(job.dueAt);
+  const superseded = runtime.jobs
+    .list({ scheduleId: job.scheduleId, limit: SUPERSEDE_LOOKBACK })
+    .some(
+      (other) =>
+        other.id !== job.id && other.input.fingerprint === job.input.fingerprint && Date.parse(other.dueAt) > dueMs,
+    );
+  return superseded ? 'a newer run of this schedule replaced it' : null;
 }
 
 function auditSummary(audit: AuditReport): Pick<JobResult, 'score' | 'findings' | 'summary'> {
@@ -289,8 +295,10 @@ export async function runDue(runtime: Runtime, options: TickOptions = {}): Promi
     }
   }
 
-  // A job that `reclaim` failed ended in this pass, although the pass never ran it.
-  const ran: Job[] = reclaimedJobs.map((job) => runtime.jobs.get(job.id)).filter((job) => job.state === 'failed');
+  // A job that `reclaim` failed ended in this pass, although the pass never ran it. The jobs are
+  // taken as `reclaim` returned them: whatever happens to a requeued job afterwards belongs to the
+  // worker that claims it.
+  const ran: Job[] = reclaimedJobs.filter((job) => job.state === 'failed');
   for (let claimed = 0; claimed < maxJobs; claimed += 1) {
     const job = runtime.jobs.claimDue(workerId, runtime.now(), CLAIM_TTL_SECONDS);
     if (!job) break;

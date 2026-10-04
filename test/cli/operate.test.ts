@@ -10,6 +10,7 @@ import { AutopilotError } from '../../src/core/errors';
 import type { DiagnosticCheck, Job, Runtime, SecretStore } from '../../src/core/types';
 import { runDue, scheduleOverview } from '../../src/jobs/runner';
 import type { TickResult } from '../../src/jobs/runner';
+import { defaultConfig } from '../../src/core/config';
 import { tempRuntime } from '../helpers/runtime';
 
 // src/jobs/runner.ts and src/agent/runner.ts are written in the same wave; these fakes stand in for them.
@@ -211,7 +212,11 @@ describe('schedule', () => {
     const before = process.listenerCount('SIGINT');
     const result = await call('schedule', runtime, ['run'], { flags: { watch: true }, signal: controller.signal, io });
     expect(result.code).toBe(0);
-    expect(result.text).toBe('Queued 1, ran 1.\n');
+    // The pass is printed in full, so what a run found is not lost in an unattended terminal.
+    expect(result.text).toBe(
+      'Queued 1, ran 1.\njob_0123456789abcdef audit demo-google succeeded: Score 61, 9 findings.\n' +
+        '  ! First audit of demo-google: score 61.\n',
+    );
     expect(vi.mocked(runDue)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(runDue).mock.calls[0]?.[0]).toBe(runtime);
     expect(process.listenerCount('SIGINT')).toBe(before);
@@ -412,6 +417,15 @@ describe('agent', () => {
     await call('agent', runtime, ['audit it'], { chat: everything });
     expect(everything.seen[0]?.[1]?.content).not.toContain('demo-google');
     expect(everything.seen[1]?.[1]?.content).toContain('demo-google');
+  });
+
+  it('takes the step limit from the flag, then from the config', async () => {
+    const { runtime } = tempRuntime({ config: { ...defaultConfig(), agent: { model: 'qwen3', maxSteps: 3 } } });
+    fakeRunner();
+    await call('agent', runtime, ['audit it'], { chat: scriptedChat() });
+    expect(vi.mocked(runLocalAgent).mock.calls.at(-1)?.[1]?.maxSteps).toBe(3);
+    await call('agent', runtime, ['audit it'], { chat: scriptedChat(), flags: { 'max-steps': '5' } });
+    expect(vi.mocked(runLocalAgent).mock.calls.at(-1)?.[1]?.maxSteps).toBe(5);
   });
 
   it('exits 1 at max steps and emits the run as JSON', async () => {

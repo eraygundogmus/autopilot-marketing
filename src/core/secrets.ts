@@ -296,6 +296,8 @@ export interface IndexLockOptions {
   timeoutMs?: number;
   /** Age after which a lock file is taken to be left behind by a dead process. */
   staleMs?: number;
+  /** For tests: called right before the check that this process still owns the lock. */
+  beforeWrite?: () => void;
 }
 
 const LOCK_TIMEOUT_MS = 5000;
@@ -306,15 +308,31 @@ function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-/** Runs `run` while holding `<paths.credentials>.lock`; the lock file is removed whatever `run` does. */
-function withIndexLock<T>(paths: Paths, options: IndexLockOptions, run: () => T): T {
+/** The content of the lock file; undefined when it does not exist or cannot be read. */
+function readLockToken(lockPath: string): string | undefined {
+  try {
+    return fs.readFileSync(lockPath, 'utf8');
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Runs `run` while holding `<paths.credentials>.lock`. The lock file holds a token unique to this
+ * acquisition. `run` receives `assertOwned`, which throws `stale_state` when the file no longer
+ * holds that token; on release the file is removed only while it still holds it, so a holder that
+ * lost a stale lock neither writes over its successor nor removes the successor's lock.
+ */
+function withIndexLock<T>(paths: Paths, options: IndexLockOptions, run: (assertOwned: () => void) => T): T {
   const lockPath = `${paths.credentials}.lock`;
   const timeoutMs = options.timeoutMs ?? LOCK_TIMEOUT_MS;
   const staleMs = options.staleMs ?? LOCK_STALE_MS;
+  const token = randomBytes(8).toString('hex');
   fs.mkdirSync(path.dirname(lockPath), { recursive: true });
   const deadline = Date.now() + timeoutMs;
-  let fd: number | undefined;
-  while (fd === undefined) {
+  let held = false;
+  while (!held) {
+    let fd: number;
     try {
       fd = fs.openSync(lockPath, 'wx', 0o600);
     } catch (error) {
@@ -324,6 +342,7 @@ function withIndexLock<T>(paths: Paths, options: IndexLockOptions, run: () => T)
           cause: error,
         });
       }
+      const seen = readLockToken(lockPath);
       let ageMs: number | undefined;
       try {
         ageMs = Date.now() - fs.statSync(lockPath).mtimeMs;
@@ -332,7 +351,8 @@ function withIndexLock<T>(paths: Paths, options: IndexLockOptions, run: () => T)
         continue;
       }
       if (ageMs > staleMs) {
-        fs.rmSync(lockPath, { force: true });
+        // Remove only the lock that was judged stale: a lock another process created since holds another token.
+        if (seen !== undefined && readLockToken(lockPath) === seen) fs.rmSync(lockPath, { force: true });
         continue;
       }
       if (Date.now() >= deadline) {
@@ -341,13 +361,28 @@ function withIndexLock<T>(paths: Paths, options: IndexLockOptions, run: () => T)
         });
       }
       sleepSync(LOCK_RETRY_MS);
+      continue;
     }
+    try {
+      fs.writeSync(fd, token);
+    } finally {
+      fs.closeSync(fd);
+    }
+    held = true;
   }
+  const assertOwned = (): void => {
+    if (readLockToken(lockPath) !== token) {
+      throw new AutopilotError(
+        'stale_state',
+        'The credential index lock was taken over by another process; nothing was written.',
+        { retryable: true },
+      );
+    }
+  };
   try {
-    return run();
+    return run(assertOwned);
   } finally {
-    fs.closeSync(fd);
-    fs.rmSync(lockPath, { force: true });
+    if (readLockToken(lockPath) === token) fs.rmSync(lockPath, { force: true });
   }
 }
 
@@ -358,16 +393,19 @@ function newCredentialIndex(): CredentialIndex {
 /**
  * Reads the index (creating it with a new profile when it does not exist), applies `mutate` to
  * its names and writes it back, all under an exclusive lock, so concurrent updates do not lose
- * each other. Returns the index as written.
+ * each other. Returns the index as written. Throws `stale_state` and writes nothing when the lock
+ * was taken over before the write.
  */
 export function updateCredentialIndex(
   paths: Paths,
   mutate: (names: string[]) => string[],
   options: IndexLockOptions = {},
 ): CredentialIndex {
-  return withIndexLock(paths, options, () => {
+  return withIndexLock(paths, options, (assertOwned) => {
     const current = readCredentialIndex(paths) ?? newCredentialIndex();
     const next: CredentialIndex = { profile: current.profile, names: [...new Set(mutate([...current.names]))].sort() };
+    options.beforeWrite?.();
+    assertOwned();
     writeCredentialIndex(paths, next);
     return next;
   });
@@ -380,10 +418,12 @@ export function updateCredentialIndex(
 export function ensureCredentialIndex(paths: Paths, options: IndexLockOptions = {}): CredentialIndex {
   const existing = readCredentialIndex(paths);
   if (existing !== null) return existing;
-  return withIndexLock(paths, options, () => {
+  return withIndexLock(paths, options, (assertOwned) => {
     const raced = readCredentialIndex(paths);
     if (raced !== null) return raced;
     const created = newCredentialIndex();
+    options.beforeWrite?.();
+    assertOwned();
     writeCredentialIndex(paths, created);
     return created;
   });

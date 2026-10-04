@@ -1,4 +1,4 @@
-import { envFor } from '../core/env';
+import { credentialUnavailable } from '../core/env';
 import { AutopilotError, toAutopilotError } from '../core/errors';
 import type {
   AttrValue,
@@ -65,18 +65,56 @@ function bool(value: unknown): boolean | null {
   return null;
 }
 
-/** Variables still needed for either Basic auth or OAuth2 client credentials. */
+const AUTH_NAMES = ['MAUTIC_CLIENT_ID', 'MAUTIC_CLIENT_SECRET', 'MAUTIC_USERNAME', 'MAUTIC_PASSWORD'] as const;
+
+type AuthName = (typeof AUTH_NAMES)[number];
+
+interface AuthScope {
+  /** Names in the scope that are kept in the credential store but could not be read. */
+  unavailable: string[];
+  values: Partial<Record<AuthName, string>>;
+}
+
+/**
+ * The one set of variables the account authenticates with: its prefixed names as soon as one of
+ * them has a value or is unreadable, else the global names. Values are never mixed across the two
+ * sets, and an unreadable name in the set leaves the account without credentials, because any
+ * other credential may belong to another identity.
+ */
+function authScope(deps: ConnectorDeps): AuthScope {
+  const { env, account } = deps;
+  const read = (name: string): string | undefined => {
+    const value = env[name];
+    return typeof value === 'string' && value !== '' ? value : undefined;
+  };
+  const prefix = account.envPrefix ?? '';
+  const own =
+    prefix !== '' && AUTH_NAMES.some((name) => read(prefix + name) !== undefined || credentialUnavailable(env, prefix + name));
+  const scope = own ? prefix : '';
+  const unavailable = AUTH_NAMES.map((name) => scope + name).filter((name) => credentialUnavailable(env, name));
+  const values: Partial<Record<AuthName, string>> = {};
+  if (unavailable.length > 0) return { unavailable, values };
+  for (const name of AUTH_NAMES) {
+    const value = read(scope + name);
+    if (value !== undefined) values[name] = value;
+  }
+  return { unavailable, values };
+}
+
+/** Variables still needed for either Basic auth or OAuth2 client credentials; unreadable ones by their full name. */
 export function mauticAuthMissing(deps: ConnectorDeps): string[] {
-  const has = (name: string): boolean => envFor(deps.env, deps.account, name) !== undefined;
-  if (has('MAUTIC_CLIENT_ID') && has('MAUTIC_CLIENT_SECRET')) return [];
-  if (has('MAUTIC_USERNAME') && has('MAUTIC_PASSWORD')) return [];
+  const { unavailable, values } = authScope(deps);
+  if (unavailable.length > 0) return unavailable;
+  if (values.MAUTIC_CLIENT_ID !== undefined && values.MAUTIC_CLIENT_SECRET !== undefined) return [];
+  if (values.MAUTIC_USERNAME !== undefined && values.MAUTIC_PASSWORD !== undefined) return [];
   return ['MAUTIC_CLIENT_ID', 'MAUTIC_CLIENT_SECRET'];
 }
 
 async function authorization(deps: ConnectorDeps): Promise<string> {
-  const { env, account } = deps;
-  const clientId = envFor(env, account, 'MAUTIC_CLIENT_ID');
-  const clientSecret = envFor(env, account, 'MAUTIC_CLIENT_SECRET');
+  const { account } = deps;
+  const { unavailable, values } = authScope(deps);
+  const clientId = values.MAUTIC_CLIENT_ID;
+  const clientSecret = values.MAUTIC_CLIENT_SECRET;
   if (clientId !== undefined && clientSecret !== undefined) {
     const base = baseUrl(deps);
     const key = `${base}\n${clientId}`;
@@ -99,8 +137,8 @@ async function authorization(deps: ConnectorDeps): Promise<string> {
     tokenCache.set(key, { token, usableUntil: nowMs + expiresIn * 1000 - TOKEN_SAFETY_MS });
     return `Bearer ${token}`;
   }
-  const username = envFor(env, account, 'MAUTIC_USERNAME');
-  const password = envFor(env, account, 'MAUTIC_PASSWORD');
+  const username = values.MAUTIC_USERNAME;
+  const password = values.MAUTIC_PASSWORD;
   if (username !== undefined && password !== undefined) {
     return `Basic ${Buffer.from(`${username}:${password}`, 'utf8').toString('base64')}`;
   }
@@ -109,9 +147,11 @@ async function authorization(deps: ConnectorDeps): Promise<string> {
     `Mautic credentials are missing for account '${account.id}': set MAUTIC_CLIENT_ID and MAUTIC_CLIENT_SECRET, or MAUTIC_USERNAME and MAUTIC_PASSWORD`,
     {
       hint:
-        account.envPrefix !== undefined && account.envPrefix !== ''
-          ? `Variables may carry the account prefix '${account.envPrefix}'.`
-          : 'Add them to the .env file in the autopilot home directory.',
+        unavailable.length > 0
+          ? `The credential store could not be read for: ${unavailable.join(', ')}. No other credentials are used in their place.`
+          : account.envPrefix !== undefined && account.envPrefix !== ''
+            ? `Variables may carry the account prefix '${account.envPrefix}'.`
+            : 'Add them to the .env file in the autopilot home directory.',
     },
   );
 }

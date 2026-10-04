@@ -459,7 +459,8 @@ describe('applyPlan execution', () => {
   it.each(['throw', 'retryable'] as const)('never resends after %s and reconciles an observed change', async (mode) => {
     const f = fixture([action('one'), action('two')]);
     f.approve();
-    f.applySteps.push((item) => {
+    f.applySteps.push((item, options) => {
+      options.beforeWrite!();
       f.states.set(stateKey(item), { status: 'PAUSED', unrelated: 'changed independently' });
       if (mode === 'throw') throw new AutopilotError('platform_error', 'Connection lost.', { retryable: true, cause: { token: 'secret' } });
       return { ok: false, dryRun: false, after: null, error: { code: 'timeout', message: 'Connection lost.', retryable: true } };
@@ -475,17 +476,22 @@ describe('applyPlan execution', () => {
   it('marks a thrown mutation failed when only the old state is observed', async () => {
     const f = fixture([action('one'), action('two')]);
     f.approve();
-    f.applySteps.push(() => { throw new Error('Connection lost.'); });
+    f.applySteps.push((_item, options) => {
+      options.beforeWrite!();
+      throw new Error('Connection lost.');
+    });
     const outcome = await applyPlan(f.plan.id, f.runtime, LIVE);
     expect(outcome).toMatchObject({ applied: 0, failed: 1, skipped: 1, unknown: 0 });
     expect(f.apply).toHaveBeenCalledTimes(1);
+    expect(f.readState).toHaveBeenCalledTimes(2);
     expect(f.ledger.read({ events: ['action.failed'] })).toHaveLength(1);
   });
 
   it.each(['different', 'read-error'] as const)('leaves %s ambiguous state unknown and stops', async (mode) => {
     const f = fixture([action('one'), action('two')]);
     f.approve();
-    f.applySteps.push((item) => {
+    f.applySteps.push((item, options) => {
+      options.beforeWrite!();
       f.states.set(stateKey(item), { status: 'REMOVED' });
       if (mode === 'read-error') f.readSteps.push(() => { throw new Error('Cannot reconcile.'); });
       throw new Error('Mutation timed out.');
@@ -495,6 +501,51 @@ describe('applyPlan execution', () => {
     expect(outcome.results.map((result) => result.status)).toEqual(['unknown', 'skipped']);
     expect(f.apply).toHaveBeenCalledTimes(1);
     expect(f.ledger.read({ events: ['action.unknown'] })).toHaveLength(1);
+    assertLockReleased(f);
+  });
+
+  it.each(['before', 'after'] as const)
+  ('records a retryable rejection %s dispatch when reconciliation is unavailable', async (stage) => {
+    const f = fixture([action('one'), action('two')]);
+    f.approve();
+    const reconcileRead = vi.fn(() => { throw new Error('Cannot reconcile.'); });
+    f.readSteps.push(() => ({ status: 'ENABLED' }), reconcileRead);
+    const beforeWrite = vi.fn<() => void>();
+    f.applySteps.push((_item, options) => {
+      beforeWrite.mockImplementation(options.beforeWrite!);
+      if (stage === 'after') beforeWrite();
+      throw new AutopilotError('platform_error', 'Connection lost.', { retryable: true });
+    });
+
+    const outcome = await applyPlan(f.plan.id, f.runtime, LIVE);
+    const dispatched = stage === 'after';
+    const status = dispatched ? 'unknown' : 'failed';
+    expect(outcome).toMatchObject({
+      applied: 0, failed: dispatched ? 0 : 1, skipped: 1, unknown: dispatched ? 1 : 0,
+      plan: { status: 'failed' },
+    });
+    expect(outcome.results.map((result) => result.status)).toEqual([status, 'skipped']);
+    expect(outcome.results[0]?.result?.error).toEqual({
+      code: 'platform_error', message: 'Connection lost.', retryable: true,
+    });
+    expect(outcome.results[1]?.note).toBe(dispatched ? 'a previous action has an unknown outcome' : 'a previous action failed');
+    expect(beforeWrite).toHaveBeenCalledTimes(dispatched ? 1 : 0);
+    if (dispatched) expect(beforeWrite.mock.results[0]?.type).toBe('return');
+    expect(f.apply).toHaveBeenCalledTimes(1);
+    expect(f.readState).toHaveBeenCalledTimes(dispatched ? 2 : 1);
+    expect(reconcileRead).toHaveBeenCalledTimes(dispatched ? 1 : 0);
+    const entries = actionEntries(f);
+    expect(entries.map((entry) => entry.event)).toEqual(['action.intent', `action.${status}`, 'action.skipped']);
+    expect(entries[1]).toMatchObject({
+      actionId: entries[0]!.actionId, executionId: entries[0]!.executionId,
+      idempotencyKey: entries[0]!.idempotencyKey,
+      data: { error: { code: 'platform_error', message: 'Connection lost.' } },
+    });
+    expect(entries[1]!.seq).toBeGreaterThan(entries[0]!.seq);
+    expect(f.ledger.read({ events: ['action.reconciled'] })).toEqual([]);
+    expect(f.ledger.read({ events: [dispatched ? 'action.failed' : 'action.unknown'] })).toEqual([]);
+    expect(f.store.getPlan(f.plan.id)).toEqual(outcome.plan);
+    expect(f.ledger.verify().ok).toBe(true);
     assertLockReleased(f);
   });
 
@@ -686,6 +737,65 @@ describe('applyPlan execution', () => {
     assertLockReleased(f);
   });
 
+  it.each(['kill switch', 'approval expiry'] as const)
+  ('skips an intended write when %s stops execution during a connector read', async (stop) => {
+    const f = fixture([action('one'), action('two')]);
+    const receipt = f.approve();
+    const write = vi.fn();
+    const beforeWrite = vi.fn<() => void>();
+    let resume!: () => void;
+    let entered!: () => void;
+    const read = new Promise<void>((resolve) => { resume = resolve; });
+    const reading = new Promise<void>((resolve) => { entered = resolve; });
+    f.applySteps.push(async (item, options) => {
+      entered();
+      await read;
+      beforeWrite.mockImplementation(options.beforeWrite!);
+      beforeWrite();
+      write();
+      f.states.set(stateKey(item), item.after);
+      return { ok: true, dryRun: false, after: null };
+    });
+    const applying = applyPlan(f.plan.id, f.runtime, LIVE);
+    await reading;
+    try {
+      if (stop === 'kill switch') f.control.killed = true;
+      else f.control.now = new Date(Date.parse(receipt.expiresAt) + 1);
+    } finally {
+      resume();
+    }
+
+    const outcome = await applying;
+    const reason = stop === 'kill switch' ? 'the kill switch is active' : 'the approval receipt expired';
+    expect(beforeWrite).toHaveBeenCalledTimes(1);
+    expect(beforeWrite.mock.results[0]).toMatchObject({
+      type: 'throw', value: { code: 'stale_state', message: reason },
+    });
+    expect(write).not.toHaveBeenCalled();
+    expect(f.apply).toHaveBeenCalledTimes(1);
+    expect(f.readState).toHaveBeenCalledTimes(1);
+    expect(outcome).toMatchObject({ applied: 0, failed: 0, skipped: 2, unknown: 0, plan: { status: 'failed' } });
+    expect(outcome.results.map((result) => result.status)).toEqual(['skipped', 'skipped']);
+    expect(outcome.results.map((result) => result.note)).toEqual([reason, reason]);
+    expect(outcome.results.every((result) => result.result === null)).toBe(true);
+    expect(f.states.get('ad:one')).toEqual({ status: 'ENABLED' });
+    expect(f.states.get('ad:two')).toEqual({ status: 'ENABLED' });
+    const entries = actionEntries(f);
+    expect(entries.map((entry) => entry.event)).toEqual(['action.intent', 'action.skipped', 'action.skipped']);
+    expect(entries[1]).toMatchObject({
+      actionId: entries[0]!.actionId, executionId: entries[0]!.executionId, data: { reason },
+    });
+    expect(entries[1]!.seq).toBeGreaterThan(entries[0]!.seq);
+    expect(entries[2]).toMatchObject({ actionId: f.plan.actions[1]!.id, data: { reason } });
+    expect(f.ledger.read({ events: ['action.unknown', 'action.reconciled'] })).toEqual([]);
+    expect(f.ledger.read().at(-1)).toMatchObject({
+      event: 'execution.closed', data: { applied: 0, failed: 0, skipped: 2, unknown: 0, status: 'failed' },
+    });
+    expect(f.store.getPlan(f.plan.id)).toEqual(outcome.plan);
+    expect(f.ledger.verify().ok).toBe(true);
+    assertLockReleased(f);
+  });
+
   it.each(['initial check', 'connector read'] as const)
   ('skips every action with the caller guard reason when the job is lost during the %s', async (stage) => {
     const f = fixture([action('one'), action('two')]);
@@ -839,7 +949,10 @@ describe('applyPlan execution', () => {
       if (reads++ === 0) return { code: 'rejected', message: 'Rejected.', retryable: false };
       throw new Error('Unreadable result.');
     } });
-    f.applySteps.push(() => result);
+    f.applySteps.push((_item, options) => {
+      options.beforeWrite!();
+      return result;
+    });
     await expect(applyPlan(f.plan.id, f.runtime, LIVE)).rejects.toThrow('Unreadable result.');
     expect(f.store.getPlan(f.plan.id)).toMatchObject({ status: 'failed', actions: [{ status: 'unknown' }] });
     expect(f.apply).toHaveBeenCalledTimes(1);

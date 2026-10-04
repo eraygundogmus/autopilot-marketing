@@ -412,6 +412,89 @@ describe('updateCredentialIndex', () => {
     expect(fs.readdirSync(paths.home)).toEqual(['credentials.json']);
   });
 
+  it('writes nothing and keeps the lock of a successor that took the lock over', () => {
+    const paths = tempPaths();
+    writeCredentialIndex(paths, { profile: PROFILE, names: ['FIRST'] });
+    let caught: unknown;
+    try {
+      updateCredentialIndex(paths, (names) => [...names, 'MINE'], {
+        beforeWrite: () => {
+          fs.writeFileSync(lockOf(paths), 'successortoken00');
+          writeCredentialIndex(paths, { profile: PROFILE, names: ['FIRST', 'SUCCESSOR'] });
+        },
+      });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(AutopilotError);
+    expect((caught as AutopilotError).code).toBe('stale_state');
+    expect((caught as AutopilotError).retryable).toBe(true);
+    expect((caught as AutopilotError).message).toBe(
+      'The credential index lock was taken over by another process; nothing was written.',
+    );
+    expect(readCredentialIndex(paths)).toEqual({ profile: PROFILE, names: ['FIRST', 'SUCCESSOR'] });
+    expect(fs.readFileSync(lockOf(paths), 'utf8')).toBe('successortoken00');
+  });
+
+  it('writes nothing when its lock file is gone before the write', () => {
+    const paths = tempPaths();
+    writeCredentialIndex(paths, { profile: PROFILE, names: ['FIRST'] });
+    expect(
+      codeOf(() =>
+        updateCredentialIndex(paths, (names) => {
+          fs.rmSync(lockOf(paths));
+          return [...names, 'MINE'];
+        }),
+      ),
+    ).toBe('stale_state');
+    expect(readCredentialIndex(paths)).toEqual({ profile: PROFILE, names: ['FIRST'] });
+    expect(fs.existsSync(lockOf(paths))).toBe(false);
+  });
+
+  it('does not create the index on a first run whose lock was taken over', () => {
+    const paths = tempPaths();
+    expect(
+      codeOf(() => ensureCredentialIndex(paths, { beforeWrite: () => fs.writeFileSync(lockOf(paths), 'successortoken00') })),
+    ).toBe('stale_state');
+    expect(fs.existsSync(paths.credentials)).toBe(false);
+    expect(fs.readFileSync(lockOf(paths), 'utf8')).toBe('successortoken00');
+  });
+
+  it('holds a token of its own in the lock and removes that lock after a normal update', () => {
+    const paths = tempPaths();
+    const tokens: string[] = [];
+    for (const name of ['ONE', 'TWO']) {
+      updateCredentialIndex(paths, (names) => [...names, name], {
+        beforeWrite: () => tokens.push(fs.readFileSync(lockOf(paths), 'utf8')),
+      });
+      expect(fs.existsSync(lockOf(paths))).toBe(false);
+    }
+    expect(tokens).toHaveLength(2);
+    expect(tokens[0]).toMatch(/^[0-9a-f]{16}$/);
+    expect(tokens[1]).toMatch(/^[0-9a-f]{16}$/);
+    expect(tokens[1]).not.toBe(tokens[0]);
+    expect(readCredentialIndex(paths)?.names).toEqual(['ONE', 'TWO']);
+  });
+
+  it('takes a stale lock over with a new token', () => {
+    const paths = tempPaths();
+    writeCredentialIndex(paths, { profile: PROFILE, names: [] });
+    fs.writeFileSync(lockOf(paths), 'deadholdertoken0');
+    const old = new Date(Date.now() - 60000);
+    fs.utimesSync(lockOf(paths), old, old);
+    let during = '';
+    const result = updateCredentialIndex(paths, (names) => [...names, 'TOKEN'], {
+      timeoutMs: 100,
+      beforeWrite: () => {
+        during = fs.readFileSync(lockOf(paths), 'utf8');
+      },
+    });
+    expect(during).toMatch(/^[0-9a-f]{16}$/);
+    expect(during).not.toBe('deadholdertoken0');
+    expect(result.names).toEqual(['TOKEN']);
+    expect(fs.existsSync(lockOf(paths))).toBe(false);
+  });
+
   it('creates the index with a profile and accumulates names over sequential updates', () => {
     const paths = tempPaths();
     const first = updateCredentialIndex(paths, (names) => [...names, 'META_TOKEN']);

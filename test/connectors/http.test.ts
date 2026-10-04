@@ -257,6 +257,78 @@ describe('createHttpClient', () => {
     expect(h.sleeps).toEqual([500, 1000, 2000]);
   });
 
+  it('removes the Bearer token of the request from an echoed error body', async () => {
+    const token = 'ya29.runtime-issued-token';
+    const h = harness([new Response(`Invalid token ${token} (Authorization: Bearer ${token})`, { status: 401 })]);
+    const http = createHttpClient({ fetch: h.fetch, sleep: h.sleep, env: {} });
+    const error = await failure(
+      http.request({ url: 'https://api.test/v1/x', headers: { authorization: `Bearer ${token}` } }),
+    );
+    expect(error.message).not.toContain(token);
+    expect(String(error.body)).not.toContain(token);
+    expect(error.message).toContain('Invalid token [redacted]');
+    expect(h.calls[0]?.headers['authorization']).toBe(`Bearer ${token}`);
+  });
+
+  it('removes an access_token query value from an echoed error body', async () => {
+    const inline = 'inline-token-value';
+    const param = 'param token/value';
+    const h = harness([new Response(`bad ${inline} and ${param} and ${encodeURIComponent(param)}`, { status: 401 })]);
+    const http = createHttpClient({ fetch: h.fetch, sleep: h.sleep, env: {} });
+    const error = await failure(
+      http.request({ url: `https://api.test/v1/x?access_token=${inline}`, query: { token: param } }),
+    );
+    for (const text of [error.message, String(error.body)]) {
+      expect(text).not.toContain(inline);
+      expect(text).not.toContain(param);
+      expect(text).not.toContain(encodeURIComponent(param));
+    }
+    expect(error.message).toBe('GET https://api.test/v1/x -> 401: bad [redacted] and [redacted] and [redacted]');
+  });
+
+  it('removes a client_secret form field from an echoed error body', async () => {
+    const secret = 'GOCSPX-form-secret';
+    const h = harness([json({ error: 'invalid_client', detail: `client_secret=${secret}` }, 401)]);
+    const http = createHttpClient({ fetch: h.fetch, sleep: h.sleep, env: {} });
+    const error = await failure(
+      http.request({ url: 'https://api.test/token', form: { grant_type: 'refresh_token', client_secret: secret } }),
+    );
+    expect(error.message).not.toContain(secret);
+    expect(String(error.body)).not.toContain(secret);
+    expect(error.message).toContain('client_secret=[redacted]');
+    expect(h.calls[0]?.body).toContain(secret);
+  });
+
+  it('removes Basic credentials in encoded and decoded form', async () => {
+    const password = 'mautic-pass-9';
+    const encoded = Buffer.from(`admin:${password}`).toString('base64');
+    const h = harness([new Response(`denied ${encoded} / admin:${password} / ${password}`, { status: 401 })]);
+    const http = createHttpClient({ fetch: h.fetch, sleep: h.sleep, env: {} });
+    const error = await failure(
+      http.request({ url: 'https://api.test/v1/x', headers: { Authorization: `Basic ${encoded}` } }),
+    );
+    for (const text of [error.message, String(error.body)]) {
+      expect(text).not.toContain(encoded);
+      expect(text).not.toContain(password);
+    }
+    expect(error.message).toBe('GET https://api.test/v1/x -> 401: denied [redacted] / [redacted] / [redacted]');
+  });
+
+  it('leaves a credential shorter than 6 characters alone', async () => {
+    const h = harness([new Response('value abcde is not valid', { status: 400 })]);
+    const http = createHttpClient({ fetch: h.fetch, sleep: h.sleep, env: {} });
+    const error = await failure(http.request({ url: 'https://api.test/v1/x', query: { key: 'abcde' } }));
+    expect(error.message).toBe('GET https://api.test/v1/x -> 400: value abcde is not valid');
+  });
+
+  it('does not alter a successful response that echoes a credential', async () => {
+    const token = 'ya29.runtime-issued-token';
+    const h = harness([json({ access_token: token })]);
+    const http = createHttpClient({ fetch: h.fetch, sleep: h.sleep, env: {} });
+    const res = await http.request({ url: 'https://api.test/token', form: { code: token } });
+    expect(res.body).toEqual({ access_token: token });
+  });
+
   it('rejects a URL that is not absolute', async () => {
     const h = harness([json({})]);
     const error = await failure(createHttpClient({ fetch: h.fetch }).request({ url: '/relative' }));

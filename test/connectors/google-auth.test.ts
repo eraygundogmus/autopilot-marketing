@@ -417,7 +417,95 @@ describe('unavailable credentials', () => {
     const env = envWith({ GOOGLE_APPLICATION_CREDENTIALS: '/some/global-key.json' }, [
       'ACME_GOOGLE_APPLICATION_CREDENTIALS',
     ]);
-    expect(googleAuthMissing(env, prefixed)).toEqual(['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REFRESH_TOKEN']);
+    expect(googleAuthMissing(env, prefixed)).toContain('ACME_GOOGLE_APPLICATION_CREDENTIALS');
+    const { error, requests } = await rejection(env, prefixed);
+    expect(error).toMatchObject({ code: 'not_configured' });
+    expect(requests).toHaveLength(0);
+  });
+
+  it('does not select a global service-account file when the prefixed refresh token is unavailable', async () => {
+    const env = envWith(
+      {
+        ACME_GOOGLE_CLIENT_ID: 'acme-client',
+        ACME_GOOGLE_CLIENT_SECRET: 'acme-secret',
+        GOOGLE_APPLICATION_CREDENTIALS: '/some/global-key.json',
+      },
+      ['ACME_GOOGLE_REFRESH_TOKEN'],
+    );
+    expect(googleAuthMissing(env, prefixed)).toEqual(['ACME_GOOGLE_REFRESH_TOKEN']);
+    const { error, requests } = await rejection(env, prefixed);
+    expect(error).toMatchObject({ code: 'not_configured' });
+    expect((error as AutopilotError).hint ?? '').toContain('ACME_GOOGLE_REFRESH_TOKEN');
+    expect(requests).toHaveLength(0);
+  });
+
+  it('does not select the global refresh trio when the prefixed credentials file is unavailable', async () => {
+    const env = envWith(refreshEnv, ['ACME_GOOGLE_APPLICATION_CREDENTIALS']);
+    expect(googleAuthMissing(env, prefixed)).toEqual([
+      'ACME_GOOGLE_CLIENT_ID',
+      'ACME_GOOGLE_CLIENT_SECRET',
+      'ACME_GOOGLE_REFRESH_TOKEN',
+      'ACME_GOOGLE_APPLICATION_CREDENTIALS',
+    ]);
+    const { error, requests } = await rejection(env, prefixed);
+    expect(error).toMatchObject({ code: 'not_configured' });
+    expect(requests).toHaveLength(0);
+  });
+
+  it('selects no flow when the prefixed credentials file is unavailable beside a complete prefixed trio', async () => {
+    const env = envWith(
+      {
+        ACME_GOOGLE_CLIENT_ID: 'acme-client',
+        ACME_GOOGLE_CLIENT_SECRET: 'acme-secret',
+        ACME_GOOGLE_REFRESH_TOKEN: 'acme-refresh',
+      },
+      ['ACME_GOOGLE_APPLICATION_CREDENTIALS'],
+    );
+    expect(googleAuthMissing(env, prefixed)).toEqual(['ACME_GOOGLE_APPLICATION_CREDENTIALS']);
+    const { error, requests } = await rejection(env, prefixed);
+    expect(error).toMatchObject({ code: 'not_configured' });
+    expect(requests).toHaveLength(0);
+  });
+
+  it('selects no flow for an unprefixed account whose global credentials file is unavailable', async () => {
+    const env = envWith(refreshEnv, ['GOOGLE_APPLICATION_CREDENTIALS']);
+    expect(googleAuthMissing(env, account)).toEqual(['GOOGLE_APPLICATION_CREDENTIALS']);
+    const { error, requests } = await rejection(env, account);
+    expect(error).toMatchObject({ code: 'not_configured' });
+    expect(requests).toHaveLength(0);
+  });
+
+  it('never reads the global scope when the prefixed scope is complete and readable', async () => {
+    const env = envWith(
+      {
+        ...refreshEnv,
+        ACME_GOOGLE_CLIENT_ID: 'acme-client',
+        ACME_GOOGLE_CLIENT_SECRET: 'acme-secret',
+        ACME_GOOGLE_REFRESH_TOKEN: 'acme-refresh',
+      },
+      ['GOOGLE_REFRESH_TOKEN', 'GOOGLE_APPLICATION_CREDENTIALS'],
+    );
+    expect(googleAuthMissing(env, prefixed)).toEqual([]);
+    const { http, requests } = fakeHttp([{ access_token: 'token-a', expires_in: 3600 }]);
+    await getGoogleAccessToken({
+      env,
+      account: prefixed,
+      http,
+      scopes: [GOOGLE_ADS_SCOPE],
+      now: clock('2026-01-01T00:00:00Z').now,
+    });
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.form).toEqual({
+      grant_type: 'refresh_token',
+      client_id: 'acme-client',
+      client_secret: 'acme-secret',
+      refresh_token: 'acme-refresh',
+    });
+  });
+
+  it('does not borrow a global service-account file for a partly configured prefixed scope', async () => {
+    const env = envWith({ ACME_GOOGLE_CLIENT_ID: 'acme-client', GOOGLE_APPLICATION_CREDENTIALS: '/some/global-key.json' }, []);
+    expect(googleAuthMissing(env, prefixed)).toEqual(['ACME_GOOGLE_CLIENT_SECRET', 'ACME_GOOGLE_REFRESH_TOKEN']);
     const { error, requests } = await rejection(env, prefixed);
     expect(error).toMatchObject({ code: 'not_configured' });
     expect(requests).toHaveLength(0);

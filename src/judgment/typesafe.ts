@@ -1,3 +1,4 @@
+import { credentialUnavailable } from '../core/env';
 import { canonicalJson, sha256 } from '../core/ids';
 import type { Answer, Env, JudgmentConfig, JudgmentUsage, JsonValue, Question, TypeSafeClient } from '../core/types';
 import { chargeMeter } from './usage';
@@ -107,9 +108,18 @@ function defaultSleep(ms: number): Promise<void> {
   });
 }
 
+/**
+ * TYPESAFE_API_KEY, or its alias TYPESAFE_AI_KEY. A name that is kept in the credential store but
+ * cannot be read is missing: the other name may hold a stale key and is not used in its place.
+ */
+function apiKey(env: Env): string {
+  if (credentialUnavailable(env, 'TYPESAFE_API_KEY') || credentialUnavailable(env, 'TYPESAFE_AI_KEY')) return '';
+  return env.TYPESAFE_API_KEY || env.TYPESAFE_AI_KEY || '';
+}
+
 export function createTypeSafeClient(options: TypeSafeOptions): TypeSafeClient {
   const { config } = options;
-  const key = options.env.TYPESAFE_API_KEY || options.env.TYPESAFE_AI_KEY || '';
+  const key = apiKey(options.env);
   const available = key.length > 0;
   const maxAttempts = Math.max(1, options.maxAttempts ?? 5);
   const timeoutMs = options.timeoutMs ?? 60000;

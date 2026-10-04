@@ -1,6 +1,6 @@
 import { createHash, createSign } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { credentialUnavailable, envFor } from '../core/env';
+import { credentialUnavailable } from '../core/env';
 import { AutopilotError } from '../core/errors';
 import type { AccountConfig, Env, HttpClient } from '../core/types';
 
@@ -42,43 +42,71 @@ function envValue(env: Env, name: string): string | undefined {
   return typeof value === 'string' && value !== '' ? value : undefined;
 }
 
-/**
- * The three refresh-flow values, all from one scope so that two identities never mix: when any
- * account-prefixed name (canonical or alias) is set or is unavailable, every value comes from
- * prefixed names; otherwise every value comes from the global names. The canonical name wins over
- * its alias. An unavailable name has no value and blocks its fallbacks: an unavailable canonical
- * name is not replaced by its alias, and an unavailable prefixed name is not replaced by a global one.
- */
-function resolveRefreshVars(env: Env, account: AccountConfig): { prefix: string; values: (string | undefined)[] } {
-  const read = (prefix: string): (string | undefined)[] =>
-    REFRESH_VARS.map(([name, alias]) => {
-      if (credentialUnavailable(env, prefix + name)) return undefined;
-      const canonical = envValue(env, prefix + name);
-      if (canonical !== undefined) return canonical;
-      return credentialUnavailable(env, prefix + alias) ? undefined : envValue(env, prefix + alias);
-    });
-  const prefix = account.envPrefix ?? '';
-  if (prefix !== '') {
-    const values = read(prefix);
-    const claimed =
-      values.some((value) => value !== undefined) ||
-      REFRESH_VARS.some((names) => names.some((name) => credentialUnavailable(env, prefix + name)));
-    if (claimed) return { prefix, values };
-  }
-  return { prefix: '', values: read('') };
+interface GoogleCredentials {
+  /** The prefix of the one scope every value below comes from: the account's prefix, or ''. */
+  prefix: string;
+  /** Client id, client secret and refresh token, in `REFRESH_VARS` order. */
+  refresh: (string | undefined)[];
+  credentialsFile: string | undefined;
+  /** Names of the scope that are needed and cannot be read. Non-empty means no flow may be selected. */
+  unavailable: string[];
 }
 
 /**
- * Names of the variables still needed for either the refresh-token or the service-account flow.
- * A name carries the account prefix when the refresh values resolve from the prefixed scope.
+ * Every Google credential of the account, from one scope so that two identities never mix. The
+ * scope is the prefixed one when the account has a prefix and any prefixed Google name (refresh
+ * names, their aliases, the credentials-file variable) has a value or is unavailable; otherwise it
+ * is the global one. Nothing is ever read from the other scope.
+ *
+ * The canonical refresh name wins over its alias. An unavailable name has no value and blocks its
+ * fallbacks: an unavailable canonical name is not replaced by its alias, and an unavailable alias
+ * counts only when the canonical name has no value. An unavailable alias is reported under its
+ * canonical name.
+ */
+function resolveGoogleCredentials(env: Env, account: AccountConfig): GoogleCredentials {
+  const read = (prefix: string): GoogleCredentials => {
+    const unavailable: string[] = [];
+    const refresh = REFRESH_VARS.map(([name, alias]) => {
+      if (!credentialUnavailable(env, prefix + name)) {
+        const canonical = envValue(env, prefix + name);
+        if (canonical !== undefined) return canonical;
+        if (!credentialUnavailable(env, prefix + alias)) return envValue(env, prefix + alias);
+      }
+      unavailable.push(prefix + name);
+      return undefined;
+    });
+    const fileUnavailable = credentialUnavailable(env, prefix + CREDENTIALS_VAR);
+    if (fileUnavailable) unavailable.push(prefix + CREDENTIALS_VAR);
+    const credentialsFile = fileUnavailable ? undefined : envValue(env, prefix + CREDENTIALS_VAR);
+    return { prefix, refresh, credentialsFile, unavailable };
+  };
+  const prefix = account.envPrefix ?? '';
+  if (prefix !== '') {
+    const scoped = read(prefix);
+    const claimed =
+      scoped.unavailable.length > 0 ||
+      scoped.credentialsFile !== undefined ||
+      scoped.refresh.some((value) => value !== undefined) ||
+      REFRESH_VARS.some(([, alias]) => credentialUnavailable(env, prefix + alias));
+    if (claimed) return scoped;
+  }
+  return read('');
+}
+
+/**
+ * Names of the variables still needed, all from the account's one scope. When any name of the scope
+ * is unavailable these are the refresh names without a value plus the credentials-file variable if
+ * it is unavailable, whatever else is set. Otherwise empty when either flow is complete, else the
+ * refresh names without a value.
  */
 export function googleAuthMissing(env: Env, account: AccountConfig): string[] {
-  if (envFor(env, account, CREDENTIALS_VAR) !== undefined) return [];
-  const { prefix, values } = resolveRefreshVars(env, account);
+  const { prefix, refresh, credentialsFile, unavailable } = resolveGoogleCredentials(env, account);
+  if (unavailable.length === 0 && credentialsFile !== undefined) return [];
   const missing: string[] = [];
   REFRESH_VARS.forEach(([name], index) => {
-    if (values[index] === undefined) missing.push(prefix + name);
+    if (refresh[index] === undefined) missing.push(prefix + name);
   });
+  if (unavailable.includes(prefix + CREDENTIALS_VAR)) missing.push(prefix + CREDENTIALS_VAR);
   return missing;
 }
 
@@ -172,8 +200,10 @@ export async function getGoogleAccessToken(options: {
   now: () => Date;
 }): Promise<string> {
   const { env, account, http, scopes, now } = options;
-  const [clientId, clientSecret, refreshToken] = resolveRefreshVars(env, account).values;
-  const credentialsFile = envFor(env, account, CREDENTIALS_VAR);
+  const resolved = resolveGoogleCredentials(env, account);
+  const usable = resolved.unavailable.length === 0;
+  const [clientId, clientSecret, refreshToken] = usable ? resolved.refresh : [];
+  const credentialsFile = usable ? resolved.credentialsFile : undefined;
 
   let key: string;
   let fetchToken: () => Promise<CachedToken>;
@@ -206,7 +236,7 @@ export async function getGoogleAccessToken(options: {
       );
   } else {
     const names = REFRESH_VARS.map(([name]) => name);
-    const prefix = account.envPrefix ?? '';
+    const prefix = resolved.prefix;
     throw new AutopilotError('not_configured', `Google credentials are not configured for account '${account.id}'.`, {
       hint:
         `Set ${names.map((name) => prefix + name).join(', ')} ` +

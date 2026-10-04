@@ -4,7 +4,8 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { credentialUnavailable, envFor, loadEnv, missingEnv } from '../../src/core/env';
 import { resolvePaths } from '../../src/core/paths';
-import type { AccountConfig } from '../../src/core/types';
+import type { AccountConfig, JudgmentConfig } from '../../src/core/types';
+import { createTypeSafeClient } from '../../src/judgment/typesafe';
 
 function homeWithEnv(lines: string[]): ReturnType<typeof resolvePaths> {
   const home = mkdtempSync(join(tmpdir(), 'apm-'));
@@ -47,5 +48,18 @@ describe('loadEnv with the credential store', () => {
     expect(envFor(blocked, account, 'META_ACCESS_TOKEN')).toBeUndefined();
     // Another account without the prefix still reads the shared credential.
     expect(envFor(blocked, { ...account, id: 'other', envPrefix: '' }, 'META_ACCESS_TOKEN')).toBe('token-of-another-identity');
+  });
+});
+
+describe('the Jev key and the credential store', () => {
+  const config: JudgmentConfig = { model: 'jev', budgetUsd: 1, actThreshold: 0.8, gateThreshold: 0.9, usdPerMillionInputTokens: 2 };
+
+  it('does not use the alias from .env when the registered key cannot be read', () => {
+    const paths = homeWithEnv(['TYPESAFE_AI_KEY=stale-alias-key-from-file']);
+    const blocked = loadEnv(paths, {}, { values: {}, blocked: ['TYPESAFE_API_KEY'] });
+    expect(createTypeSafeClient({ env: blocked, config }).available).toBe(false);
+
+    const readable = loadEnv(paths, {}, { values: { TYPESAFE_API_KEY: 'key-from-store' }, blocked: [] });
+    expect(createTypeSafeClient({ env: readable, config }).available).toBe(true);
   });
 });

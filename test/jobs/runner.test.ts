@@ -277,6 +277,73 @@ describe('runDue', () => {
     expect(tick.ran.find((job) => job.id === tick.enqueued[0])?.state).toBe('succeeded');
   });
 
+  it('runs the replacement when the old-zone job has a later slot', async () => {
+    const now = (): Date => new Date('2026-10-04T08:00:00Z');
+    const at7: ScheduleConfig = { ...daily, at: '07:00' };
+    const zoned = (timezone: string) => ({
+      schedules: [at7],
+      accounts: defaultConfig().accounts.map((account) =>
+        account.id === 'demo-google' ? { ...account, timezone } : account,
+      ),
+    });
+    const { runtime, home } = tempRuntime({ config: zoned('UTC'), now });
+    const first = await runDue(runtime);
+    expect(first.ran).toHaveLength(1);
+    expect(first.ran[0]!.dueAt).toBe('2026-10-04T07:00:00.000Z');
+    expect(first.ran[0]!.state).toBe('succeeded');
+
+    writeFileSync(join(home, 'config.json'), JSON.stringify({ ...defaultConfig(), ...zoned('America/New_York') }));
+    const moved = createRuntime({ env: { AUTOPILOT_HOME: home }, now });
+    const tick = await runDue(moved);
+    expect(tick.enqueued).toHaveLength(1);
+    expect(tick.ran).toHaveLength(1);
+    expect(tick.ran[0]!.id).toBe(tick.enqueued[0]);
+    expect(tick.ran[0]!.dueAt).toBe('2026-10-03T11:00:00.000Z');
+    expect(tick.ran[0]!.state).toBe('succeeded');
+  });
+
+  it('does not report a requeued job that another worker then fails', async () => {
+    const { runtime, clock } = setup();
+    const queued = await runDue(runtime, { maxJobs: 0 });
+    const id = queued.enqueued[0]!;
+    expect(runtime.jobs.claimDue('dead-worker', clock.now, 600)?.id).toBe(id);
+    clock.now = new Date(clock.now.getTime() + 601_000);
+
+    const reclaim = runtime.jobs.reclaim.bind(runtime.jobs);
+    vi.spyOn(runtime.jobs, 'reclaim').mockImplementationOnce((now, maxAttempts) => {
+      const reclaimed = reclaim(now, maxAttempts);
+      const theirs = runtime.jobs.claimDue('other-worker', clock.now, 600);
+      expect(theirs?.id).toBe(id);
+      expect(runtime.jobs.finish(theirs!, clock.now, { state: 'failed', error: 'boom', attention: ['Job failed: boom'] })).toBe(true);
+      return reclaimed;
+    });
+    const tick = await runDue(runtime);
+    expect(tick.reclaimed).toEqual([id]);
+    expect(tick.ran).toEqual([]);
+    expect(tick.attention).toBe(false);
+    expect(runtime.jobs.get(id).state).toBe('failed');
+    vi.restoreAllMocks();
+  });
+
+  it('reports a requeued job once when this pass claims and ends it', async () => {
+    const { runtime, clock } = setup();
+    const queued = await runDue(runtime, { maxJobs: 0 });
+    const id = queued.enqueued[0]!;
+    runtime.jobs.claimDue('dead-worker', clock.now, 600);
+    clock.now = new Date(clock.now.getTime() + 601_000);
+
+    const idle = await runDue(runtime, { maxJobs: 0 });
+    expect(idle.reclaimed).toEqual([id]);
+    expect(idle.ran).toEqual([]);
+    expect(runtime.jobs.get(id).state).toBe('queued');
+
+    runtime.jobs.claimDue('dead-worker', clock.now, 600);
+    clock.now = new Date(clock.now.getTime() + 601_000);
+    const tick = await runDue(runtime);
+    expect(tick.reclaimed).toEqual([id]);
+    expect(tick.ran.map((job) => [job.id, job.state])).toEqual([[id, 'succeeded']]);
+  });
+
   it('retries an audit whose snapshot is empty, then fails it with attention', async () => {
     const { runtime, clock } = setup();
     const real = (await vi.importActual<typeof import('../../src/ops/data')>('../../src/ops/data')).takeSnapshot;
