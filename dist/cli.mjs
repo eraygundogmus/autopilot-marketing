@@ -20193,8 +20193,9 @@ var MAX_RETRY_AFTER_MS = 3e4;
 var MAX_BACKOFF_MS = 8e3;
 var ERROR_BODY_CHARS = 300;
 var ERROR_DETAIL_CHARS = 4e3;
-var MIN_SECRET_CHARS = 6;
+var MIN_SCRUB_CHARS = 3;
 var REDACTED = "[redacted]";
+var WITHHELD = "[response withheld: it may contain a credential that is too short to remove safely]";
 var SECRET_FIELDS = /* @__PURE__ */ new Set([
   "access_token",
   "refresh_token",
@@ -20207,15 +20208,13 @@ var SECRET_FIELDS = /* @__PURE__ */ new Set([
   "assertion"
 ]);
 function requestSecrets(url2, headers, form) {
-  const found = /* @__PURE__ */ new Set();
+  const raw = /* @__PURE__ */ new Set();
   const add3 = (value) => {
-    found.add(value);
-    found.add(encodeURIComponent(value));
-    found.add(new URLSearchParams({ v: value }).toString().slice(2));
+    if (value !== "") raw.add(value);
   };
-  for (const [name, raw] of Object.entries(headers)) {
+  for (const [name, header2] of Object.entries(headers)) {
     if (name.toLowerCase() !== "authorization") continue;
-    const value = raw.trim();
+    const value = header2.trim();
     add3(value);
     const match = /^(\S+)\s+(.+)$/.exec(value);
     if (match === null) continue;
@@ -20234,12 +20233,47 @@ function requestSecrets(url2, headers, form) {
   for (const [name, value] of Object.entries(form ?? {})) {
     if (SECRET_FIELDS.has(name.toLowerCase())) add3(value);
   }
-  return [...found].filter((value) => value.length >= MIN_SECRET_CHARS).sort((a, b) => b.length - a.length);
+  const values = /* @__PURE__ */ new Set();
+  let withhold = false;
+  for (const value of raw) {
+    if (value.length < MIN_SCRUB_CHARS) {
+      withhold = true;
+      continue;
+    }
+    values.add(value);
+    values.add(encodeURIComponent(value));
+    values.add(new URLSearchParams({ v: value }).toString().slice(2));
+    values.add(JSON.stringify(value).slice(1, -1));
+  }
+  return { values: [...values].sort((a, b) => b.length - a.length), withhold };
 }
 function scrub(text8, secrets) {
   let out = text8;
   for (const secret of secrets) out = out.split(secret).join(REDACTED);
   return out;
+}
+function scrubJson(value, secrets) {
+  if (typeof value === "string") return scrub(value, secrets);
+  if (Array.isArray(value)) return value.map((item) => scrubJson(item, secrets));
+  if (typeof value === "object" && value !== null) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [scrub(key, secrets), scrubJson(item, secrets)])
+    );
+  }
+  return value;
+}
+function scrubResponse(text8, secrets) {
+  if (secrets.withhold) return WITHHELD;
+  if (secrets.values.length === 0) return text8;
+  let source = text8;
+  try {
+    const parsed = JSON.parse(text8);
+    const before = JSON.stringify(parsed);
+    const after = JSON.stringify(scrubJson(parsed, secrets.values));
+    if (after !== before) source = after;
+  } catch {
+  }
+  return scrub(source, secrets.values);
 }
 function defaultSleep(ms) {
   return new Promise((resolve) => {
@@ -20280,7 +20314,7 @@ function createHttpClient(options = {}) {
         resHeaders[key.toLowerCase()] = value;
       });
       if (res.status < 200 || res.status >= 300) {
-        const cleaned = clean(scrub(text8, secrets));
+        const cleaned = clean(scrubResponse(text8, secrets));
         const message = `${where} -> ${res.status}: ${cleaned.slice(0, ERROR_BODY_CHARS)}`;
         const wait = retryAfterMs(resHeaders["retry-after"]);
         const details = { status: res.status, body: cleaned.slice(0, ERROR_DETAIL_CHARS) };
@@ -20328,7 +20362,7 @@ function createHttpClient(options = {}) {
     }
     const method = req.method ?? (body === void 0 ? "GET" : "POST");
     const secrets = requestSecrets(url2, headers, req.form);
-    const where = scrub(`${method} ${url2.origin}${url2.pathname}`, secrets);
+    const where = scrub(`${method} ${url2.origin}${url2.pathname}`, secrets.values);
     const attempts = req.retry ?? method === "GET" ? maxAttempts : 1;
     const timeoutMs = req.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     for (let attempt = 1; ; attempt += 1) {
@@ -23341,16 +23375,33 @@ async function readMembership(deps, draft2) {
 }
 var EMAIL_PAGE_LIMIT = 100;
 var EMAIL_MAX_PAGES = 5;
+function unreadableList() {
+  return new AutopilotError("platform_error", "Mautic returned an email list that cannot be read.", {
+    retryable: true
+  });
+}
+function ambiguousWrite() {
+  return new AutopilotError(
+    "platform_error",
+    "Mautic accepted the request but its response does not say what was created.",
+    { retryable: true }
+  );
+}
 function emailEntries(body) {
   const emails = isRecord7(body) ? body["emails"] : void 0;
-  const pairs = Array.isArray(emails) ? emails.map((item) => [null, item]) : isRecord7(emails) ? Object.entries(emails) : [];
+  let pairs;
+  if (Array.isArray(emails)) pairs = emails.map((item) => [null, item]);
+  else if (isRecord7(emails)) pairs = Object.entries(emails);
+  else throw unreadableList();
   return pairs.map(([key, item]) => {
-    const value = isRecord7(item) ? item["id"] : void 0;
-    const name = isRecord7(item) ? item["name"] : void 0;
+    if (!isRecord7(item)) throw unreadableList();
+    const value = item["id"];
+    const name = item["name"];
+    if (typeof name !== "string") throw unreadableList();
     return {
       id: typeof value === "string" || typeof value === "number" ? String(value) : key,
-      name: typeof name === "string" ? name : null,
-      fields: isRecord7(item) ? item : null
+      name,
+      fields: item
     };
   });
 }
@@ -23363,7 +23414,7 @@ async function findEmailByName(deps, name) {
       method: "GET"
     });
     const entries = emailEntries(body);
-    const match = entries.find((entry) => entry.name !== null && entry.name.trim() === wanted);
+    const match = entries.find((entry) => entry.name.trim() === wanted);
     if (match !== void 0) return { exists: true, id: match.id, fields: match.fields };
     const rawTotal = isRecord7(body) ? body["total"] : void 0;
     const total = typeof rawTotal === "number" ? rawTotal : typeof rawTotal === "string" ? Number(rawTotal) : NaN;
@@ -23414,12 +23465,14 @@ async function applyLive(deps, action, beforeWrite) {
     case "mautic.segment.remove_contact": {
       const { segmentId, contactId } = segmentIds(action);
       const adding = action.kind === "mautic.segment.add_contact";
-      await send(
+      const body = await send(
         deps,
         `/segments/${segmentId}/contact/${contactId}/${adding ? "add" : "remove"}`,
         { method: "POST", retry: false },
         beforeWrite
       );
+      const success2 = isRecord7(body) ? body["success"] : void 0;
+      if (success2 !== true && success2 !== 1 && success2 !== "1") throw ambiguousWrite();
       return { ok: true, dryRun: false, after: { member: adding }, resource: segmentId };
     }
     case "mautic.email.create_draft": {
@@ -23448,11 +23501,7 @@ async function applyLive(deps, action, beforeWrite) {
       );
       const email3 = isRecord7(body) ? body["email"] : void 0;
       const id = isRecord7(email3) ? email3["id"] : void 0;
-      if (typeof id !== "string" && typeof id !== "number") {
-        throw new AutopilotError("platform_error", "Mautic did not return the id of the created email.", {
-          hint: "Check the Mautic email list before retrying: the draft may exist."
-        });
-      }
+      if ((typeof id !== "string" || id.trim() === "") && typeof id !== "number") throw ambiguousWrite();
       return { ok: true, dryRun: false, after: { exists: true }, resource: String(id) };
     }
     default:

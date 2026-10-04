@@ -99,21 +99,40 @@ interface ExistingEmail {
 const EMAIL_PAGE_LIMIT = 100;
 const EMAIL_MAX_PAGES = 5;
 
-/** Emails of one page; Mautic answers with an array or with an object keyed by id. */
-function emailEntries(body: JsonValue): Array<{ id: string | null; name: string | null; fields: EmailFields | null }> {
+function unreadableList(): AutopilotError {
+  return new AutopilotError('platform_error', 'Mautic returned an email list that cannot be read.', {
+    retryable: true,
+  });
+}
+
+/** A 2xx answer to a sent write that does not say what happened: the outcome is unknown, not failed. */
+function ambiguousWrite(): AutopilotError {
+  return new AutopilotError(
+    'platform_error',
+    'Mautic accepted the request but its response does not say what was created.',
+    { retryable: true },
+  );
+}
+
+/**
+ * Emails of one page; Mautic answers with an array or with an object keyed by id. Anything else, or an entry
+ * without a readable name, throws: an unreadable list never means that no email exists.
+ */
+function emailEntries(body: JsonValue): Array<{ id: string | null; name: string; fields: EmailFields }> {
   const emails = isRecord(body) ? body['emails'] : undefined;
-  const pairs: Array<[string | null, JsonValue]> = Array.isArray(emails)
-    ? emails.map((item): [string | null, JsonValue] => [null, item])
-    : isRecord(emails)
-      ? Object.entries(emails)
-      : [];
+  let pairs: Array<[string | null, JsonValue]>;
+  if (Array.isArray(emails)) pairs = emails.map((item): [string | null, JsonValue] => [null, item]);
+  else if (isRecord(emails)) pairs = Object.entries(emails);
+  else throw unreadableList();
   return pairs.map(([key, item]) => {
-    const value = isRecord(item) ? item['id'] : undefined;
-    const name = isRecord(item) ? item['name'] : undefined;
+    if (!isRecord(item)) throw unreadableList();
+    const value = item['id'];
+    const name = item['name'];
+    if (typeof name !== 'string') throw unreadableList();
     return {
       id: typeof value === 'string' || typeof value === 'number' ? String(value) : key,
-      name: typeof name === 'string' ? name : null,
-      fields: isRecord(item) ? item : null,
+      name,
+      fields: item,
     };
   });
 }
@@ -131,7 +150,7 @@ async function findEmailByName(deps: ConnectorDeps, name: string): Promise<Exist
       method: 'GET',
     });
     const entries = emailEntries(body);
-    const match = entries.find((entry) => entry.name !== null && entry.name.trim() === wanted);
+    const match = entries.find((entry) => entry.name.trim() === wanted);
     if (match !== undefined) return { exists: true, id: match.id, fields: match.fields };
     const rawTotal = isRecord(body) ? body['total'] : undefined;
     const total = typeof rawTotal === 'number' ? rawTotal : typeof rawTotal === 'string' ? Number(rawTotal) : NaN;
@@ -200,12 +219,14 @@ async function applyLive(deps: ConnectorDeps, action: Action, beforeWrite: () =>
     case 'mautic.segment.remove_contact': {
       const { segmentId, contactId } = segmentIds(action);
       const adding = action.kind === 'mautic.segment.add_contact';
-      await send(
+      const body = await send(
         deps,
         `/segments/${segmentId}/contact/${contactId}/${adding ? 'add' : 'remove'}`,
         { method: 'POST', retry: false },
         beforeWrite,
       );
+      const success = isRecord(body) ? body['success'] : undefined;
+      if (success !== true && success !== 1 && success !== '1') throw ambiguousWrite();
       return { ok: true, dryRun: false, after: { member: adding }, resource: segmentId };
     }
     case 'mautic.email.create_draft': {
@@ -234,11 +255,7 @@ async function applyLive(deps: ConnectorDeps, action: Action, beforeWrite: () =>
       );
       const email = isRecord(body) ? body['email'] : undefined;
       const id = isRecord(email) ? email['id'] : undefined;
-      if (typeof id !== 'string' && typeof id !== 'number') {
-        throw new AutopilotError('platform_error', 'Mautic did not return the id of the created email.', {
-          hint: 'Check the Mautic email list before retrying: the draft may exist.',
-        });
-      }
+      if ((typeof id !== 'string' || id.trim() === '') && typeof id !== 'number') throw ambiguousWrite();
       return { ok: true, dryRun: false, after: { exists: true }, resource: String(id) };
     }
     default:

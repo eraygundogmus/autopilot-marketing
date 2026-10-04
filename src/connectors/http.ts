@@ -18,8 +18,10 @@ const MAX_BACKOFF_MS = 8_000;
 const ERROR_BODY_CHARS = 300;
 const ERROR_DETAIL_CHARS = 4000;
 
-const MIN_SECRET_CHARS = 6;
+/** Below this length a by-value replacement would shred ordinary text. */
+const MIN_SCRUB_CHARS = 3;
 const REDACTED = '[redacted]';
+const WITHHELD = '[response withheld: it may contain a credential that is too short to remove safely]';
 const SECRET_FIELDS = new Set([
   'access_token',
   'refresh_token',
@@ -32,22 +34,30 @@ const SECRET_FIELDS = new Set([
   'assertion',
 ]);
 
+interface RequestSecrets {
+  /** Every form a credential of this request may take in echoed text, longest first. */
+  values: readonly string[];
+  /** True when a credential is too short to remove by value: response text must not be shown. */
+  withhold: boolean;
+}
+
 /**
- * The credentials one request carries, longest first so that a value containing another is replaced
- * whole. Values shorter than MIN_SECRET_CHARS are left out: they would match ordinary text.
+ * The credentials one request carries. A known credential is never echoed, whatever its length:
+ * those of MIN_SCRUB_CHARS or more are replaced by value, shorter ones set `withhold`.
  */
-function requestSecrets(url: URL, headers: Record<string, string>, form: Record<string, string> | undefined): string[] {
-  const found = new Set<string>();
+function requestSecrets(
+  url: URL,
+  headers: Record<string, string>,
+  form: Record<string, string> | undefined,
+): RequestSecrets {
+  const raw = new Set<string>();
   const add = (value: string): void => {
-    found.add(value);
-    // A platform may echo the value as it travelled on the wire.
-    found.add(encodeURIComponent(value));
-    found.add(new URLSearchParams({ v: value }).toString().slice(2));
+    if (value !== '') raw.add(value);
   };
 
-  for (const [name, raw] of Object.entries(headers)) {
+  for (const [name, header] of Object.entries(headers)) {
     if (name.toLowerCase() !== 'authorization') continue;
-    const value = raw.trim();
+    const value = header.trim();
     add(value);
     const match = /^(\S+)\s+(.+)$/.exec(value);
     if (match === null) continue;
@@ -67,13 +77,58 @@ function requestSecrets(url: URL, headers: Record<string, string>, form: Record<
     if (SECRET_FIELDS.has(name.toLowerCase())) add(value);
   }
 
-  return [...found].filter((value) => value.length >= MIN_SECRET_CHARS).sort((a, b) => b.length - a.length);
+  const values = new Set<string>();
+  let withhold = false;
+  for (const value of raw) {
+    if (value.length < MIN_SCRUB_CHARS) {
+      withhold = true;
+      continue;
+    }
+    values.add(value);
+    // A platform may echo the value as it travelled on the wire, or inside a JSON string.
+    values.add(encodeURIComponent(value));
+    values.add(new URLSearchParams({ v: value }).toString().slice(2));
+    values.add(JSON.stringify(value).slice(1, -1));
+  }
+  // Longest first, so that a value containing another is replaced whole.
+  return { values: [...values].sort((a, b) => b.length - a.length), withhold };
 }
 
 function scrub(text: string, secrets: readonly string[]): string {
   let out = text;
   for (const secret of secrets) out = out.split(secret).join(REDACTED);
   return out;
+}
+
+/** Scrubs every string of a parsed JSON value, keys included. */
+function scrubJson(value: unknown, secrets: readonly string[]): unknown {
+  if (typeof value === 'string') return scrub(value, secrets);
+  if (Array.isArray(value)) return value.map((item: unknown) => scrubJson(item, secrets));
+  if (typeof value === 'object' && value !== null) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]: [string, unknown]) => [scrub(key, secrets), scrubJson(item, secrets)]),
+    );
+  }
+  return value;
+}
+
+/**
+ * Response text with the request's own credentials removed. A JSON body is scrubbed on its decoded
+ * strings as well, where no escaping can hide a value; a body without an echo is returned as sent.
+ */
+function scrubResponse(text: string, secrets: RequestSecrets): string {
+  if (secrets.withhold) return WITHHELD;
+  if (secrets.values.length === 0) return text;
+  let source = text;
+  try {
+    const parsed: unknown = JSON.parse(text);
+    const before = JSON.stringify(parsed);
+    const after = JSON.stringify(scrubJson(parsed, secrets.values));
+    if (after !== before) source = after;
+  } catch {
+    // Not JSON: the text-based scrubbing below is all that applies.
+  }
+  return scrub(source, secrets.values);
 }
 
 interface Attempt {
@@ -118,7 +173,7 @@ export function createHttpClient(options: HttpOptions = {}): HttpClient {
     headers: Record<string, string>,
     body: string | undefined,
     timeoutMs: number,
-    secrets: readonly string[],
+    secrets: RequestSecrets,
   ): Promise<Attempt> {
     const controller = new AbortController();
     let timedOut = false;
@@ -139,7 +194,7 @@ export function createHttpClient(options: HttpOptions = {}): HttpClient {
       if (res.status < 200 || res.status >= 300) {
         // Redaction sees the whole body: a secret cut by truncation would no longer be recognised.
         // The request's own credentials go first: one issued at run time is not in the environment.
-        const cleaned = clean(scrub(text, secrets));
+        const cleaned = clean(scrubResponse(text, secrets));
         const message = `${where} -> ${res.status}: ${cleaned.slice(0, ERROR_BODY_CHARS)}`;
         const wait = retryAfterMs(resHeaders['retry-after']);
         // The message stays short; the longer body is for code that classifies the failure.
@@ -199,7 +254,7 @@ export function createHttpClient(options: HttpOptions = {}): HttpClient {
     const method = req.method ?? (body === undefined ? 'GET' : 'POST');
     const secrets = requestSecrets(url, headers, req.form);
     // No query string, and no credential of this request, ever reaches a message.
-    const where = scrub(`${method} ${url.origin}${url.pathname}`, secrets);
+    const where = scrub(`${method} ${url.origin}${url.pathname}`, secrets.values);
     const attempts = (req.retry ?? method === 'GET') ? maxAttempts : 1;
     const timeoutMs = req.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 

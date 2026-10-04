@@ -295,6 +295,63 @@ describe('applyMauticAction', () => {
     expect(posts(calls)).toHaveLength(0);
   });
 
+  it('rethrows as retryable when the create answer does not name the created email', async () => {
+    for (const answer of [{ email: {} }, {}, '<html>ok</html>'] as JsonValue[]) {
+      const { deps, calls } = makeDeps((request) => (request.method === 'POST' ? answer : { total: 0, emails: [] }));
+      await expect(applyMauticAction(deps, toAction(emailDraft()), live)).rejects.toMatchObject({
+        code: 'platform_error',
+        retryable: true,
+        message: 'Mautic accepted the request but its response does not say what was created.',
+      });
+      expect(posts(calls)).toHaveLength(1);
+    }
+  });
+
+  it('rethrows as retryable when a segment write answer does not confirm success', async () => {
+    for (const answer of [{}, { success: 0 }, '<html>ok</html>'] as JsonValue[]) {
+      const { deps, calls } = makeDeps(() => answer);
+      await expect(
+        applyMauticAction(deps, toAction(segmentDraft('mautic.segment.add_contact')), live),
+      ).rejects.toMatchObject({ code: 'platform_error', retryable: true });
+      expect(posts(calls)).toHaveLength(1);
+    }
+  });
+
+  it('rejects an unreadable email list instead of reading it as absent', async () => {
+    const lists: JsonValue[] = [
+      {},
+      '<html>login</html>',
+      { total: 1, emails: 'x' },
+      { total: 1, emails: [null] },
+      { total: 1, emails: [{ id: 12 }] },
+    ];
+    for (const list of lists) {
+      const { deps, calls } = makeDeps((request) => (request.method === 'POST' ? { email: { id: 31 } } : list));
+      const unreadable = {
+        code: 'platform_error',
+        retryable: true,
+        message: 'Mautic returned an email list that cannot be read.',
+      };
+      await expect(readMauticState(deps, emailDraft())).rejects.toMatchObject(unreadable);
+      await expect(applyMauticAction(deps, toAction(emailDraft()), live)).rejects.toMatchObject(unreadable);
+      expect(posts(calls)).toHaveLength(0);
+    }
+  });
+
+  it('reads a well-formed empty list as absent and creates', async () => {
+    for (const emails of [[], {}] as JsonValue[]) {
+      const { deps, calls } = makeDeps((request) =>
+        request.method === 'POST' ? { email: { id: 31 } } : { total: 0, emails },
+      );
+      await expect(readMauticState(deps, emailDraft())).resolves.toEqual({ exists: false });
+      await expect(applyMauticAction(deps, toAction(emailDraft()), live)).resolves.toMatchObject({
+        ok: true,
+        resource: '31',
+      });
+      expect(posts(calls)).toHaveLength(1);
+    }
+  });
+
   it('makes no POST on a dry run', async () => {
     const segment = makeDeps(() => ({ lists: [] }));
     await expect(
@@ -353,7 +410,7 @@ describe('applyMauticAction beforeWrite', () => {
     const events: string[] = [];
     const made = makeDeps((request) => {
       events.push(request.method ?? 'GET');
-      if (request.method === 'POST') return { email: { id: 31 } };
+      if (request.method === 'POST') return { success: 1, email: { id: 31 } };
       return { total: 0, emails: [], lists: [] };
     });
     return { ...made, events };

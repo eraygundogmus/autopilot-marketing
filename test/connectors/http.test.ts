@@ -314,11 +314,81 @@ describe('createHttpClient', () => {
     expect(error.message).toBe('GET https://api.test/v1/x -> 401: denied [redacted] / [redacted] / [redacted]');
   });
 
-  it('leaves a credential shorter than 6 characters alone', async () => {
+  it('removes a Basic password echoed in JSON-escaped form', async () => {
+    const password = 'pa"ss\\word42';
+    const escaped = JSON.stringify(password).slice(1, -1);
+    const basic = { Authorization: `Basic ${Buffer.from(`admin:${password}`).toString('base64')}` };
+
+    const asJson = harness([json({ error: { message: `bad password ${password}`, [password]: [password] } }, 401)]);
+    const a = await failure(
+      createHttpClient({ fetch: asJson.fetch, sleep: asJson.sleep, env: {} }).request({
+        url: 'https://api.test/v1/x',
+        headers: basic,
+      }),
+    );
+    // A unicode escape decodes to the same value and matches no textual form of it.
+    const unicode = harness([
+      new Response(`{"error":"bad password pa\\u0022ss\\u005cword42"}`, { status: 401 }),
+    ]);
+    const b = await failure(
+      createHttpClient({ fetch: unicode.fetch, sleep: unicode.sleep, env: {} }).request({
+        url: 'https://api.test/v1/x',
+        headers: basic,
+      }),
+    );
+    // Escaped text inside a body that is not JSON.
+    const asText = harness([new Response(`log: {"error":"bad ${escaped}"} (truncated`, { status: 401 })]);
+    const c = await failure(
+      createHttpClient({ fetch: asText.fetch, sleep: asText.sleep, env: {} }).request({
+        url: 'https://api.test/v1/x',
+        headers: basic,
+      }),
+    );
+
+    for (const error of [a, b, c]) {
+      for (const text of [error.message, String(error.body)]) {
+        expect(text).not.toContain(password);
+        expect(text).not.toContain(escaped);
+        expect(text).not.toContain('word42');
+        expect(text).toContain('[redacted]');
+      }
+    }
+    expect(b.message).toBe('GET https://api.test/v1/x -> 401: {"error":"bad password [redacted]"}');
+  });
+
+  it('removes a credential shorter than 6 characters', async () => {
+    const encoded = Buffer.from('admin:abcde').toString('base64');
     const h = harness([new Response('value abcde is not valid', { status: 400 })]);
     const http = createHttpClient({ fetch: h.fetch, sleep: h.sleep, env: {} });
-    const error = await failure(http.request({ url: 'https://api.test/v1/x', query: { key: 'abcde' } }));
-    expect(error.message).toBe('GET https://api.test/v1/x -> 400: value abcde is not valid');
+    const error = await failure(
+      http.request({ url: 'https://api.test/v1/x', headers: { Authorization: `Basic ${encoded}` } }),
+    );
+    expect(error.message).toBe('GET https://api.test/v1/x -> 400: value [redacted] is not valid');
+    expect(error.body).toBe('value [redacted] is not valid');
+  });
+
+  it('withholds the response text when a credential is too short to remove by value', async () => {
+    const withheld = '[response withheld: it may contain a credential that is too short to remove safely]';
+    const encoded = Buffer.from('admin:pw').toString('base64');
+    const h = harness([json({ error: 'password pw rejected' }, 401)]);
+    const http = createHttpClient({ fetch: h.fetch, sleep: h.sleep, env: {} });
+    const error = await failure(
+      http.request({ url: 'https://api.test/v1/x', headers: { Authorization: `Basic ${encoded}` } }),
+    );
+    expect(error.message).toBe(`GET https://api.test/v1/x -> 401: ${withheld}`);
+    expect(error.body).toBe(withheld);
+    expect(error.status).toBe(401);
+  });
+
+  it('leaves a response without a credential echo as it was sent', async () => {
+    const pretty = '{\n  "error": "missing",\n  "n": 1.0\n}';
+    const h = harness([new Response(pretty, { status: 404 })]);
+    const http = createHttpClient({ fetch: h.fetch, sleep: h.sleep, env: {} });
+    const error = await failure(
+      http.request({ url: 'https://api.test/v1/x', headers: { Authorization: 'Bearer ya29.runtime-issued-token' } }),
+    );
+    expect(error.message).toBe(`GET https://api.test/v1/x -> 404: ${pretty}`);
+    expect(error.body).toBe(pretty);
   });
 
   it('does not alter a successful response that echoes a credential', async () => {
