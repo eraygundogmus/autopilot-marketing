@@ -46,6 +46,7 @@ function fakeIo(options: { tty?: boolean; answer?: boolean } = {}): FakeIo {
       questions.push(question);
       return options.answer ?? false;
     },
+    readSecret: async () => '',
   };
 }
 
@@ -76,9 +77,9 @@ async function auditAndPlan(runtime: Runtime): Promise<{ auditId: string; planId
 }
 
 describe('workCommands', () => {
-  it('has the ten work commands', () => {
+  it('has the eleven work commands', () => {
     expect(Object.keys(workCommands).sort()).toEqual(
-      ['apply', 'approve', 'audit', 'plan', 'preview', 'report', 'revert', 'review', 'run', 'snapshot'],
+      ['apply', 'approve', 'audit', 'plan', 'preview', 'reconcile', 'report', 'revert', 'review', 'run', 'snapshot'],
     );
   });
 

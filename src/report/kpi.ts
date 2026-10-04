@@ -27,12 +27,25 @@ const CONVERSION_KEYS: ReadonlySet<keyof KpiSet> = new Set<keyof KpiSet>([
   'conversionRate',
 ]);
 
-/** The two definitions when both snapshots state one and they differ, otherwise null. */
-function definitionMismatch(current: Snapshot, previous: Snapshot | null): { current: string; previous: string } | null {
-  const now = current.conversionDefinition;
-  const before = previous?.conversionDefinition;
-  if (now === undefined || before === undefined || now === before) return null;
-  return { current: now, previous: before };
+interface Mismatch {
+  what: 'definition' | 'attribution';
+  current: string;
+  previous: string;
+}
+
+/**
+ * How the two snapshots measured conversions differently, when both state it and it differs:
+ * what counts as a conversion, or the attribution windows. Otherwise null.
+ */
+function definitionMismatch(current: Snapshot, previous: Snapshot | null): Mismatch | null {
+  const stated: Array<[Mismatch['what'], string | undefined, string | undefined]> = [
+    ['definition', current.conversionDefinition, previous?.conversionDefinition],
+    ['attribution', current.attribution, previous?.attribution],
+  ];
+  for (const [what, now, before] of stated) {
+    if (now !== undefined && before !== undefined && now !== before) return { what, current: now, previous: before };
+  }
+  return null;
 }
 
 function totalRows(snapshot: Snapshot): Row[] {
@@ -71,7 +84,7 @@ function buildFacts(input: {
   previous: KpiSet | null;
   range: DateRange;
   currency: string;
-  mismatch: { current: string; previous: string } | null;
+  mismatch: Mismatch | null;
 }): string[] {
   const { current, previous, range, currency, mismatch } = input;
   const period = `from ${range.start} to ${range.end}`;
@@ -90,7 +103,9 @@ function buildFacts(input: {
   add('CTR', 'was', 'ctr', (value) => formatPercent(value, 2));
   if (mismatch !== null) {
     facts.push(
-      `Conversions are not comparable between the two periods: the current period counts "${mismatch.current}", the previous one "${mismatch.previous}". Set META_CONVERSION_ACTION to fix the definition.`,
+      mismatch.what === 'definition'
+        ? `Conversions are not comparable between the two periods: the current period counts "${mismatch.current}", the previous one "${mismatch.previous}". Set META_CONVERSION_ACTION to fix the definition.`
+        : `Conversions are not comparable between the two periods: the current period was attributed with "${mismatch.current}", the previous one with "${mismatch.previous}".`,
     );
   }
   return facts;

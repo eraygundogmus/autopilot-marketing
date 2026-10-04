@@ -347,3 +347,73 @@ describe('applyMauticAction', () => {
     });
   });
 });
+
+describe('applyMauticAction beforeWrite', () => {
+  function recording(): { deps: ConnectorDeps; calls: HttpRequest[]; events: string[] } {
+    const events: string[] = [];
+    const made = makeDeps((request) => {
+      events.push(request.method ?? 'GET');
+      if (request.method === 'POST') return { email: { id: 31 } };
+      return { total: 0, emails: [], lists: [] };
+    });
+    return { ...made, events };
+  }
+
+  it('calls beforeWrite once, directly before the segment POST', async () => {
+    const { deps, events } = recording();
+    const result = await applyMauticAction(deps, toAction(segmentDraft('mautic.segment.add_contact')), {
+      ...live,
+      beforeWrite: () => void events.push('beforeWrite'),
+    });
+    expect(result.ok).toBe(true);
+    expect(events).toEqual(['beforeWrite', 'POST']);
+  });
+
+  it('calls beforeWrite once, after the name lookup and directly before the create POST', async () => {
+    const { deps, events } = recording();
+    const result = await applyMauticAction(deps, toAction(emailDraft()), {
+      ...live,
+      beforeWrite: () => void events.push('beforeWrite'),
+    });
+    expect(result).toMatchObject({ ok: true, resource: '31' });
+    expect(events.filter((event) => event === 'beforeWrite')).toHaveLength(1);
+    expect(events.slice(-2)).toEqual(['beforeWrite', 'POST']);
+    expect(events.slice(0, -2).every((event) => event === 'GET')).toBe(true);
+    expect(events.length).toBeGreaterThan(2);
+  });
+
+  it('lets a beforeWrite error through unchanged and sends no POST', async () => {
+    for (const refusal of [new Error('lock lost'), new AutopilotError('platform_error', 'taken over')]) {
+      for (const draft of [segmentDraft('mautic.segment.remove_contact'), emailDraft()]) {
+        const { deps, calls } = recording();
+        const pending = applyMauticAction(deps, toAction(draft), {
+          ...live,
+          beforeWrite: () => {
+            throw refusal;
+          },
+        });
+        await expect(pending).rejects.toBe(refusal);
+        expect(posts(calls)).toHaveLength(0);
+      }
+    }
+  });
+
+  it('never calls beforeWrite on validateOnly', async () => {
+    const { deps, calls } = recording();
+    const beforeWrite = vi.fn();
+    const result = await applyMauticAction(deps, toAction(emailDraft()), { ...dry, beforeWrite });
+    expect(result).toMatchObject({ ok: true, dryRun: true });
+    expect(beforeWrite).not.toHaveBeenCalled();
+    expect(posts(calls)).toHaveLength(0);
+  });
+
+  it('sends the same requests with and without beforeWrite', async () => {
+    const without = recording();
+    const withGuard = recording();
+    const act = toAction(segmentDraft('mautic.segment.add_contact'));
+    const a = await applyMauticAction(without.deps, act, live);
+    const b = await applyMauticAction(withGuard.deps, act, { ...live, beforeWrite: () => undefined });
+    expect(a).toEqual(b);
+    expect(without.calls).toEqual(withGuard.calls);
+  });
+});

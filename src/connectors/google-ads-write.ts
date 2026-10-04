@@ -325,13 +325,24 @@ export async function readGoogleAdsState(deps: ConnectorDeps, draft: ActionDraft
 export async function applyGoogleAdsAction(
   deps: ConnectorDeps,
   action: Action,
-  options: { validateOnly: boolean; idempotencyKey: string },
+  options: { validateOnly: boolean; idempotencyKey: string; beforeWrite?: () => void },
 ): Promise<ActionResult> {
   const { validateOnly } = options;
+  // An error thrown by `beforeWrite` leaves this function unchanged: it is never reported as a result.
+  let refusal: { error: unknown } | undefined;
+  const beforeWrite = (): void => {
+    try {
+      options.beforeWrite?.();
+    } catch (error) {
+      refusal = { error };
+      throw error;
+    }
+  };
   try {
     const session = await openSession(deps);
     const built = await buildOperation(deps, session, action);
     if (built === null) return { ok: true, dryRun: validateOnly, after: null };
+    if (!validateOnly) beforeWrite();
     const response = await deps.http.request<JsonValue>({
       url: `${session.base}/customers/${session.customerId}/${built.path}`,
       method: 'POST',
@@ -351,6 +362,7 @@ export async function applyGoogleAdsAction(
     if (requestId !== undefined) result.platformRequestId = requestId;
     return result;
   } catch (error) {
+    if (refusal !== undefined && refusal.error === error) throw error;
     const failure = toAutopilotError(error);
     // A retryable failure on a live call may or may not have changed the account: the executor must reconcile.
     if (failure.retryable && !validateOnly) throw failure;

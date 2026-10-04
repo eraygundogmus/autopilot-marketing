@@ -146,6 +146,57 @@ describe('demo connector', () => {
     expect(fs.existsSync(path.join(home, 'demo-state.json'))).toBe(false);
   });
 
+  it('asks the write guard directly before changing its state file, and writes nothing when it refuses', async () => {
+    const home = tempHome();
+    const deps = depsFor('google_ads', home);
+    const campaign = await firstCampaign(deps);
+    const draft: ActionDraft = {
+      kind: 'google_ads.campaign.pause',
+      target: { level: 'campaign', id: campaign.id },
+      params: {},
+      rationale: 'test',
+    };
+    const connector = createDemoConnector(deps);
+    const before = await connector.readState(draft);
+    const file = path.join(home, 'demo-state.json');
+
+    const refusal = new Error('lock lost');
+    await expect(
+      connector.apply(buildAction(draft, before), {
+        ...OPTIONS,
+        beforeWrite: () => {
+          throw refusal;
+        },
+      }),
+    ).rejects.toBe(refusal);
+    expect(fs.existsSync(file)).toBe(false);
+    expect(await connector.readState(draft)).toEqual(before);
+
+    let calls = 0;
+    const seen: boolean[] = [];
+    await connector.apply(buildAction(draft, before), {
+      ...OPTIONS,
+      beforeWrite: () => {
+        calls += 1;
+        seen.push(fs.existsSync(file));
+      },
+    });
+    expect(calls).toBe(1);
+    // The guard ran before the file was written.
+    expect(seen).toEqual([false]);
+    expect(fs.existsSync(file)).toBe(true);
+
+    let dryRunCalls = 0;
+    await connector.apply(buildAction(draft, before), {
+      validateOnly: true,
+      idempotencyKey: 'k',
+      beforeWrite: () => {
+        dryRunCalls += 1;
+      },
+    });
+    expect(dryRunCalls).toBe(0);
+  });
+
   it('adds and removes a negative keyword', async () => {
     const deps = depsFor('google_ads', tempHome());
     const campaign = await firstCampaign(deps);

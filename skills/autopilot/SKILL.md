@@ -53,7 +53,9 @@ This skill is the first stop for any work with the `autopilot` MCP server. The s
 
 ## Unattended operation
 
-- `autopilot-marketing run <accountId>` runs one cycle for one account without a conversation. The person schedules it from cron or from a scheduled agent run. You do not schedule it yourself unless the person asks.
+- `autopilot-marketing run <accountId>` runs one cycle for one account without a conversation.
+- The person can write schedules under `schedules` in `config.json` and run what is due with `autopilot-marketing schedule run` from cron or launchd. You cannot create, change or start a schedule: explain the config and let the person edit it.
+- `jobs_list` shows what the scheduled runs found. When the person asks what happened overnight or since the last conversation, call `jobs_list({ attentionOnly: true })` first, then open the audits and plans it points to with their ids.
 - `autopilot-marketing kill on` turns on the kill switch. While it is on, every live change is refused. Tell the person about it whenever they ask how to stop the system, and whenever an outcome is unknown.
 
 ## How to read the results

@@ -11,6 +11,7 @@ import type {
   SnapshotRequest,
 } from '../core/types';
 import { SEARCH_CONSOLE_SCOPE, getGoogleAccessToken, googleAuthMissing } from './google-auth';
+import { diagnoseSearchConsole } from './other-diagnose';
 import { buildSnapshot } from './snapshot';
 
 const DIMENSIONS = { queries: 'query', pages: 'page' } as const;
@@ -70,6 +71,8 @@ export function createSearchConsoleConnector(deps: ConnectorDeps): Connector {
         actions: [],
       };
     },
+
+    diagnose: () => diagnoseSearchConsole(deps),
 
     async fetchSnapshot(request: SnapshotRequest) {
       assertRange(request.dateRange);

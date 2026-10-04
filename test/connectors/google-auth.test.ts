@@ -10,8 +10,10 @@ import {
   getGoogleAccessToken,
   googleAuthMissing,
 } from '../../src/connectors/google-auth';
+import { loadEnv } from '../../src/core/env';
 import { AutopilotError } from '../../src/core/errors';
-import type { AccountConfig, HttpClient, HttpRequest, HttpResponse, JsonValue } from '../../src/core/types';
+import { resolvePaths } from '../../src/core/paths';
+import type { AccountConfig, Env, HttpClient, HttpRequest, HttpResponse, JsonValue } from '../../src/core/types';
 
 const account: AccountConfig = { id: 'acme-google', platform: 'google_ads', externalId: '1234567890' };
 const TOKEN_URL = 'https://oauth2.googleapis.com/token';
@@ -336,5 +338,94 @@ describe('getGoogleAccessToken: not configured', () => {
     expect(text).not.toContain('client-id-1');
     expect(text).not.toContain('client-secret-1');
     expect(requests).toHaveLength(0);
+  });
+});
+
+describe('unavailable credentials', () => {
+  const prefixed: AccountConfig = { ...account, envPrefix: 'ACME_' };
+
+  /** An environment on a temp home in which `blocked` names are registered but unreadable. */
+  function envWith(base: Env, blocked: string[]): Env {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apm-home-'));
+    return loadEnv(resolvePaths({ AUTOPILOT_HOME: dir }), base, { values: {}, blocked });
+  }
+
+  async function rejection(env: Env, target: AccountConfig): Promise<{ error: unknown; requests: HttpRequest[] }> {
+    const { http, requests } = fakeHttp([{ access_token: 'token-a', expires_in: 3600 }]);
+    const error = await getGoogleAccessToken({
+      env,
+      account: target,
+      http,
+      scopes: [GOOGLE_ADS_SCOPE],
+      now: clock('2026-01-01T00:00:00Z').now,
+    }).catch((caught: unknown) => caught);
+    return { error, requests };
+  }
+
+  it('does not fall back to the global identity when the prefixed refresh token is unavailable', async () => {
+    const env = envWith(refreshEnv, ['ACME_GOOGLE_REFRESH_TOKEN']);
+    expect(googleAuthMissing(env, prefixed)).toEqual([
+      'ACME_GOOGLE_CLIENT_ID',
+      'ACME_GOOGLE_CLIENT_SECRET',
+      'ACME_GOOGLE_REFRESH_TOKEN',
+    ]);
+    const { error, requests } = await rejection(env, prefixed);
+    expect(error).toMatchObject({ code: 'not_configured' });
+    expect((error as AutopilotError).hint ?? '').toContain('ACME_GOOGLE_REFRESH_TOKEN');
+    expect(requests).toHaveLength(0);
+  });
+
+  it('selects the prefixed scope when only a prefixed alias is unavailable', () => {
+    const env = envWith(refreshEnv, ['ACME_GOOGLE_ADS_CLIENT_ID']);
+    expect(googleAuthMissing(env, prefixed)).toEqual([
+      'ACME_GOOGLE_CLIENT_ID',
+      'ACME_GOOGLE_CLIENT_SECRET',
+      'ACME_GOOGLE_REFRESH_TOKEN',
+    ]);
+  });
+
+  it('does not replace an unavailable canonical name with its alias', async () => {
+    const env = envWith(
+      {
+        GOOGLE_CLIENT_ID: 'client-id-1',
+        GOOGLE_CLIENT_SECRET: 'client-secret-1',
+        GOOGLE_ADS_REFRESH_TOKEN: 'stale-refresh',
+      },
+      ['GOOGLE_REFRESH_TOKEN'],
+    );
+    expect(googleAuthMissing(env, account)).toEqual(['GOOGLE_REFRESH_TOKEN']);
+    const { error, requests } = await rejection(env, account);
+    expect(error).toMatchObject({ code: 'not_configured' });
+    expect(requests).toHaveLength(0);
+  });
+
+  it('ignores an unavailable alias when the canonical name has a value', async () => {
+    const env = envWith(refreshEnv, ['GOOGLE_ADS_REFRESH_TOKEN']);
+    expect(googleAuthMissing(env, account)).toEqual([]);
+    const { http, requests } = fakeHttp([{ access_token: 'token-a', expires_in: 3600 }]);
+    await getGoogleAccessToken({
+      env,
+      account,
+      http,
+      scopes: [GOOGLE_ADS_SCOPE],
+      now: clock('2026-01-01T00:00:00Z').now,
+    });
+    expect(requests[0]?.form?.refresh_token).toBe('refresh-token-1');
+  });
+
+  it('does not fall back to the global service-account file when the prefixed one is unavailable', async () => {
+    const env = envWith({ GOOGLE_APPLICATION_CREDENTIALS: '/some/global-key.json' }, [
+      'ACME_GOOGLE_APPLICATION_CREDENTIALS',
+    ]);
+    expect(googleAuthMissing(env, prefixed)).toEqual(['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REFRESH_TOKEN']);
+    const { error, requests } = await rejection(env, prefixed);
+    expect(error).toMatchObject({ code: 'not_configured' });
+    expect(requests).toHaveLength(0);
+  });
+
+  it('behaves as before when nothing is unavailable', () => {
+    const env = envWith(refreshEnv, []);
+    expect(googleAuthMissing(env, prefixed)).toEqual([]);
+    expect(googleAuthMissing(env, account)).toEqual([]);
   });
 });

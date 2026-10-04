@@ -25,6 +25,7 @@ export function resolvePaths(env: Env = process.env): Paths {
     brief: path.join(home, 'brief.md'),
     approvalKey: path.join(home, 'approval.key'),
     killFile: path.join(home, 'KILL'),
+    credentials: path.join(home, 'credentials.json'),
   };
 }
 

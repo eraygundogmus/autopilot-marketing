@@ -1,6 +1,7 @@
 import { missingEnv } from '../core/env';
 import { ACTION_KINDS } from '../core/types';
 import type { Connector, ConnectorDeps } from '../core/types';
+import { diagnoseMetaAds } from './meta-ads-diagnose';
 import { fetchMetaAdsSnapshot } from './meta-ads-read';
 import { applyMetaAdsAction, readMetaAdsState } from './meta-ads-write';
 
@@ -23,5 +24,6 @@ export function createMetaAdsConnector(deps: ConnectorDeps): Connector {
     fetchSnapshot: (request) => fetchMetaAdsSnapshot(deps, request),
     readState: (draft) => readMetaAdsState(deps, draft),
     apply: (action, options) => applyMetaAdsAction(deps, action, options),
+    diagnose: () => diagnoseMetaAds(deps),
   };
 }

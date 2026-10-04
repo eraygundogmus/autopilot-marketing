@@ -1,5 +1,6 @@
 import { ACTION_KINDS } from '../core/types';
 import type { Connector, ConnectorDeps, DatasetName } from '../core/types';
+import { diagnoseGoogleAds } from './google-ads-diagnose';
 import { fetchGoogleAdsSnapshot } from './google-ads-read';
 import { applyGoogleAdsAction, readGoogleAdsState } from './google-ads-write';
 import { googleAuthMissing } from './google-auth';
@@ -34,5 +35,6 @@ export function createGoogleAdsConnector(deps: ConnectorDeps): Connector {
     fetchSnapshot: (request) => fetchGoogleAdsSnapshot(deps, request),
     readState: (draft) => readGoogleAdsState(deps, draft),
     apply: (action, options) => applyGoogleAdsAction(deps, action, options),
+    diagnose: () => diagnoseGoogleAds(deps),
   };
 }

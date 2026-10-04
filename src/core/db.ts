@@ -34,6 +34,13 @@ CREATE TABLE IF NOT EXISTS locks (
 CREATE TABLE IF NOT EXISTS judgment_cache (
   key TEXT PRIMARY KEY, json TEXT NOT NULL, created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS jobs (
+  id TEXT PRIMARY KEY, schedule_id TEXT, account_id TEXT NOT NULL, task TEXT NOT NULL, state TEXT NOT NULL,
+  due_at TEXT NOT NULL, run_after TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, claimed_by TEXT, claimed_until TEXT,
+  started_at TEXT, finished_at TEXT, created_at TEXT NOT NULL, json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS jobs_state ON jobs (state, run_after);
+CREATE INDEX IF NOT EXISTS jobs_schedule ON jobs (schedule_id, due_at);
 `;
 
 /** Opens (and creates) the state database. Pass ':memory:' as `paths.db` in tests. */

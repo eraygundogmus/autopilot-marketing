@@ -27,6 +27,7 @@ function tempPaths(): Paths {
     brief: path.join(home, 'brief.md'),
     approvalKey: path.join(home, 'approval.key'),
     killFile: path.join(home, 'KILL'),
+    credentials: path.join(home, 'credentials.json'),
   };
 }
 
@@ -137,6 +138,72 @@ describe('defaultConfig and parseConfig', () => {
   it('rejects a non-object', () => {
     expect(failure(() => parseConfig(null)).code).toBe('config_invalid');
     expect(failure(() => parseConfig({ version: 1, policy: { maxActionsPerPlan: 1.5 } })).code).toBe('config_invalid');
+  });
+});
+
+describe('schedules and sharing in the config', () => {
+  const base = () => ({ version: 1, accounts: defaultConfig().accounts });
+  const problems = (raw: unknown): string => {
+    try {
+      parseConfig(raw);
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+    return '';
+  };
+
+  it('accepts schedules, a sharing policy and local runner defaults', () => {
+    const config = parseConfig({
+      ...base(),
+      accounts: defaultConfig().accounts.map((account) =>
+        account.id === 'demo-google' ? { ...account, sharing: { judgments: false, rows: false } } : account,
+      ),
+      schedules: [
+        { id: 'daily-google', accountId: 'demo-google', task: 'audit', every: '1d', at: '07:30' },
+        { id: 'meta-report', accountId: 'demo-meta', task: 'report', every: '7d', days: 14, enabled: false },
+        { id: 'cycle', accountId: 'demo-google', task: 'cycle', every: '6h' },
+      ],
+      agent: { baseUrl: 'http://127.0.0.1:11434/v1', model: 'qwen3', maxSteps: 8 },
+    });
+    expect(config.schedules).toHaveLength(3);
+    expect(config.accounts.find((account) => account.id === 'demo-google')?.sharing).toEqual({ judgments: false, rows: false });
+    expect(config.agent?.model).toBe('qwen3');
+  });
+
+  it('leaves the optional keys out when the file has none', () => {
+    const config = parseConfig(base());
+    expect('schedules' in config).toBe(false);
+    expect('agent' in config).toBe(false);
+  });
+
+  it('rejects a schedule for an unknown account, a report on a platform without one, and a duplicate id', () => {
+    const text = problems({
+      ...base(),
+      schedules: [
+        { id: 'a-one', accountId: 'nobody', task: 'audit', every: '1d' },
+        { id: 'b-two', accountId: 'demo-ga4', task: 'report', every: '1d' },
+        { id: 'b-two', accountId: 'demo-google', task: 'audit', every: '1d' },
+      ],
+    });
+    expect(text).toContain("schedules.0.accountId: unknown account 'nobody'");
+    expect(text).toContain("schedules.1.task: task 'report' needs a google_ads or meta_ads account");
+    expect(text).toContain("schedules.2.id: duplicate schedule id 'b-two'");
+  });
+
+  it('rejects intervals outside 15 minutes to 30 days and a time of day on a sub-day interval', () => {
+    const schedule = (every: string, at?: string) => ({
+      ...base(),
+      schedules: [{ id: 'a-one', accountId: 'demo-google', task: 'audit', every, ...(at === undefined ? {} : { at }) }],
+    });
+    for (const every of ['5m', '31d', '1w', 'daily', '0h', '1.5h']) expect(problems(schedule(every))).toContain('schedules.0.every');
+    for (const every of ['15m', '6h', '30d']) expect(problems(schedule(every))).toBe('');
+    expect(problems(schedule('6h', '07:00'))).toContain("schedules.0.at: 'at' needs an interval in whole days");
+    expect(problems(schedule('1d', '7:00'))).toContain('schedules.0.at');
+    expect(problems(schedule('1d', '24:00'))).toContain('schedules.0.at');
+  });
+
+  it('has no key by which a config could start a program', () => {
+    expect(problems({ ...base(), onAttention: { command: ['sh', '-c', 'true'] } })).toContain('onAttention');
   });
 });
 

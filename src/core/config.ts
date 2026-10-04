@@ -3,8 +3,10 @@ import path from 'node:path';
 import { z } from 'zod';
 import { AutopilotError } from './errors';
 import { digest } from './ids';
-import { ACTION_KINDS, AUTONOMY_LEVELS, PLATFORMS } from './types';
+import { ACTION_KINDS, AUTONOMY_LEVELS, JOB_TASKS, PLATFORMS } from './types';
 import type {
+  LocalAgentConfig,
+  ScheduleConfig,
   AccountConfig,
   Autonomy,
   AutopilotConfig,
@@ -142,6 +144,7 @@ const accountSchema = z.strictObject({
   brandTerms: z.array(z.string()).optional(),
   business: z.string().optional(),
   protected: z.array(z.string()).optional(),
+  sharing: z.strictObject({ judgments: z.boolean().optional(), rows: z.boolean().optional() }).optional(),
 });
 
 const businessSchema = z.strictObject({
@@ -149,6 +152,46 @@ const businessSchema = z.strictObject({
   description: text,
   audience: z.string().optional(),
   forbiddenPhrases: z.array(z.string()).optional(),
+});
+
+const ENTITY_ID = /^[a-z0-9][a-z0-9-]{1,40}$/;
+const EVERY = /^([1-9][0-9]{0,3})([mhd])$/;
+const MIN_EVERY_MINUTES = 15;
+const MAX_EVERY_MINUTES = 30 * 24 * 60;
+
+function everyMinutes(value: string): number | null {
+  const match = EVERY.exec(value);
+  if (!match) return null;
+  const unit = match[2] === 'm' ? 1 : match[2] === 'h' ? 60 : 24 * 60;
+  return Number(match[1]) * unit;
+}
+
+const scheduleSchema = z
+  .strictObject({
+    id: z.string().regex(ENTITY_ID, `must match ${ENTITY_ID}`),
+    accountId: z.string().min(1),
+    task: z.enum(JOB_TASKS),
+    every: z.string().refine((value) => {
+      const minutes = everyMinutes(value);
+      return minutes !== null && minutes >= MIN_EVERY_MINUTES && minutes <= MAX_EVERY_MINUTES;
+    }, "must be a whole number and a unit between '15m' and '30d', for example '6h' or '1d'"),
+    at: z
+      .string()
+      .regex(/^([01][0-9]|2[0-3]):[0-5][0-9]$/, "must be a time of day like '07:30'")
+      .optional(),
+    days: z.number().int().min(1).max(365).optional(),
+    enabled: z.boolean().optional(),
+  })
+  .superRefine((schedule, ctx) => {
+    if (schedule.at !== undefined && !schedule.every.endsWith('d')) {
+      ctx.addIssue({ code: 'custom', message: "'at' needs an interval in whole days, for example '1d'", path: ['at'] });
+    }
+  });
+
+const agentSchema = z.strictObject({
+  baseUrl: z.url().optional(),
+  model: z.string().min(1).optional(),
+  maxSteps: z.number().int().min(1).max(50).optional(),
 });
 
 const configSchema = z.strictObject({
@@ -170,6 +213,31 @@ const configSchema = z.strictObject({
   policy: policySchema.partial().optional(),
   judgment: judgmentSchema.partial().optional(),
   thresholds: thresholdsSchema.partial().optional(),
+  schedules: z.array(scheduleSchema).optional(),
+  agent: agentSchema.optional(),
+}).superRefine((config, ctx) => {
+  const accounts = new Map((config.accounts ?? []).map((account) => [account.id, account.platform]));
+  const seen = new Set<string>();
+  (config.schedules ?? []).forEach((schedule, index) => {
+    if (seen.has(schedule.id)) {
+      ctx.addIssue({ code: 'custom', message: `duplicate schedule id '${schedule.id}'`, path: ['schedules', index, 'id'] });
+    }
+    seen.add(schedule.id);
+    const platform = accounts.get(schedule.accountId);
+    if (platform === undefined) {
+      ctx.addIssue({
+        code: 'custom',
+        message: `unknown account '${schedule.accountId}'`,
+        path: ['schedules', index, 'accountId'],
+      });
+    } else if (schedule.task === 'report' && platform !== 'google_ads' && platform !== 'meta_ads') {
+      ctx.addIssue({
+        code: 'custom',
+        message: `task 'report' needs a google_ads or meta_ads account, '${schedule.accountId}' is ${platform}`,
+        path: ['schedules', index, 'task'],
+      });
+    }
+  });
 });
 
 /** Drops keys whose value is undefined, so optional properties are absent rather than undefined. */
@@ -237,6 +305,8 @@ export function parseConfig(raw: unknown): AutopilotConfig {
     thresholds: { ...DEFAULT_THRESHOLDS, ...(data.thresholds as Partial<Thresholds> | undefined) },
   };
   if (data.business !== undefined) config.business = data.business as NonNullable<AutopilotConfig['business']>;
+  if (data.schedules !== undefined) config.schedules = data.schedules as ScheduleConfig[];
+  if (data.agent !== undefined) config.agent = data.agent as LocalAgentConfig;
   return config;
 }
 

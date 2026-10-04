@@ -112,6 +112,7 @@ describe('paths', () => {
       brief: path.join('/data/apm', 'brief.md'),
       approvalKey: path.join('/data/apm', 'approval.key'),
       killFile: path.join('/data/apm', 'KILL'),
+      credentials: path.join('/data/apm', 'credentials.json'),
     });
     expect(resolvePaths({ AUTOPILOT_HOME: '~/apm-state' }).home).toBe(path.join(os.homedir(), 'apm-state'));
     expect(resolvePaths({ AUTOPILOT_HOME: '~' }).home).toBe(os.homedir());

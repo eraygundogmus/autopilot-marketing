@@ -17,8 +17,9 @@ import type {
   Runtime,
   TermJudgment,
 } from '../core/types';
+import { judgeFor, localJudge } from '../judgment/sharing';
 import { withJudgmentUsage } from '../judgment/usage';
-import { snapshotTotals } from './data';
+import { rowsShared, snapshotTotals } from './data';
 
 const DEFAULT_TERM_LIMIT = 60;
 const MAX_TERM_LIMIT = 200;
@@ -46,7 +47,7 @@ export async function auditSnapshot(
         snapshot,
         account: { ...account, ...(business === undefined ? {} : { business }) },
         thresholds: runtime.config.thresholds,
-        judge: input.judgments === false ? null : runtime.judge,
+        judge: input.judgments === false ? null : judgeFor(runtime, account),
         ...(input.checkIds === undefined ? {} : { checkIds: input.checkIds }),
         now: runtime.now(),
       }),
@@ -74,7 +75,7 @@ export async function auditSnapshot(
 export function findingEvidence(
   runtime: Runtime,
   input: { auditId: string; findingId: string },
-): { finding: Finding; rows: Array<{ dataset: string; row: Row }> } {
+): { finding: Finding; rows: Array<{ dataset: string; row: Row }>; withheld?: number } {
   const audit = runtime.store.getAudit(input.auditId);
   const finding = audit.findings.find((candidate) => candidate.id === input.findingId);
   if (!finding) {
@@ -82,6 +83,7 @@ export function findingEvidence(
       hint: 'use a finding id from this audit report',
     });
   }
+  if (!rowsShared(runtime, finding.accountId)) return { finding, rows: [], withheld: finding.evidence.length };
   const snapshot = runtime.store.getSnapshot(finding.snapshotId);
   const rows: Array<{ dataset: string; row: Row }> = [];
   for (const ref of finding.evidence) {
@@ -125,6 +127,13 @@ export async function judgeTerms(
         `snapshot ${snapshot.id} belongs to account ${snapshot.accountId}, not ${account.id}`,
       );
     }
+    if (!rowsShared(runtime, account.id)) {
+      throw new AutopilotError(
+        'policy_denied',
+        "The owner's sharing policy keeps the rows of this account on this machine, so its search terms are not listed.",
+        { hint: 'Pass the terms to judge in `terms`, or work from the findings of audit_run.' },
+      );
+    }
     currency = snapshot.currency;
     const minCost = input.minCost ?? 0;
     const candidates = (snapshot.datasets.search_terms ?? [])
@@ -149,7 +158,7 @@ export async function judgeTerms(
     async () =>
       terms.length === 0
         ? []
-        : runtime.judge.classifyTerms({
+        : judgeFor(runtime, account).classifyTerms({
             business: businessOf(runtime, account) ?? '',
             brandTerms: account.brandTerms ?? [],
             terms,
@@ -208,7 +217,7 @@ export async function judgeCopy(
     runtime,
     { operation: 'judge_copy', accountId: account.id },
     () =>
-      runtime.judge.reviewCopy({
+      judgeFor(runtime, account).reviewCopy({
         platform: account.platform,
         business: businessOf(runtime, account) ?? '',
         variants: input.variants,
@@ -241,8 +250,11 @@ export async function judgeClaims(
   }
 
   const evidence: JsonObject = {};
+  // Stored data of an account whose owner turned judgments off never goes to Jev.
+  const sources: string[] = [];
   if (input.auditId !== undefined) {
     const audit = runtime.store.getAudit(input.auditId);
+    sources.push(audit.accountId);
     // The JSON round trip drops absent impacts and yields a plain JSON value.
     evidence.audit = JSON.parse(
       JSON.stringify({
@@ -258,6 +270,7 @@ export async function judgeClaims(
   }
   if (input.snapshotId !== undefined) {
     const snapshot = runtime.store.getSnapshot(input.snapshotId);
+    sources.push(snapshot.accountId);
     const totals = snapshotTotals(snapshot);
     evidence.snapshot = {
       dateRange: { ...snapshot.dateRange },
@@ -274,8 +287,12 @@ export async function judgeClaims(
     });
   }
 
+  const restricted = sources.some(
+    (id) => runtime.config.accounts.find((account) => account.id === id)?.sharing?.judgments === false,
+  );
+  const judge = restricted ? localJudge(runtime) : runtime.judge;
   const { value: judgments, usage } = await withJudgmentUsage(runtime, { operation: 'judge_claims' }, () =>
-    runtime.judge.verifyClaims({ claims: input.claims, evidence }),
+    judge.verifyClaims({ claims: input.claims, evidence }),
   );
   return { judgments, usage };
 }

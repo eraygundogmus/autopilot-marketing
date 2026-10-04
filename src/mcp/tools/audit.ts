@@ -130,9 +130,10 @@ export function register(server: McpServer, runtime: Runtime): void {
     },
     async (args) => {
       try {
-        const { finding, rows } = findingEvidence(runtime, { auditId: args.auditId, findingId: args.findingId });
+        const { finding, rows, withheld } = findingEvidence(runtime, { auditId: args.auditId, findingId: args.findingId });
         const structured = toJson({
           finding: shapeFinding(finding),
+          withheld,
           rows: rows.map(({ dataset, row }) => ({
             dataset,
             id: row.id,
@@ -154,7 +155,11 @@ export function register(server: McpServer, runtime: Runtime): void {
           '',
           inert(finding.observation, MAX_OBSERVATION_CHARS),
           '',
-          ...(lines.length > 0 ? lines : ['No rows are attached to this finding.']),
+          ...(withheld !== undefined
+            ? [`${withheld} row(s) are kept on this machine by the owner's sharing policy for this account.`]
+            : lines.length > 0
+              ? lines
+              : ['No rows are attached to this finding.']),
         ].join('\n');
         return ok(structured, text);
       } catch (error) {

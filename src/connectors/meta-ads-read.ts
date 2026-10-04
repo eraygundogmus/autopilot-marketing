@@ -19,6 +19,10 @@ const DEFAULT_VERSION = 'v26.0';
 const MAX_PAGES = 20;
 const SUPPORTED: DatasetName[] = ['campaigns', 'ad_groups', 'ads', 'placements', 'daily'];
 const INSIGHT_FIELDS = 'impressions,clicks,spend,inline_link_clicks,reach,frequency,actions,action_values';
+/** The windows every Insights request asks for; also Meta's documented default, so stating them changes no number. */
+const ATTRIBUTION_WINDOWS = ['7d_click', '1d_view'] as const;
+const ATTRIBUTION_PARAM = JSON.stringify(ATTRIBUTION_WINDOWS);
+const ATTRIBUTION_LABEL = ATTRIBUTION_WINDOWS.join(',');
 const DEFAULT_CONVERSION_ACTIONS = [
   'purchase',
   'offsite_conversion.fb_pixel_purchase',
@@ -221,6 +225,7 @@ export async function fetchMetaAdsSnapshot(deps: ConnectorDeps, request: Snapsho
       level,
       fields: idField === '' ? INSIGHT_FIELDS : `${INSIGHT_FIELDS},${idField}`,
       time_range: timeRange,
+      action_attribution_windows: ATTRIBUTION_PARAM,
       limit: 500,
       ...extra,
     });
@@ -463,6 +468,7 @@ export async function fetchMetaAdsSnapshot(deps: ConnectorDeps, request: Snapsho
     coverage,
     warnings,
     now: deps.now(),
+    attribution: ATTRIBUTION_LABEL,
     // Absent when no conversion action was found: the conversions are then 0 by construction, not by definition.
     ...(conversionAction === undefined ? {} : { conversionDefinition: conversionAction }),
   });

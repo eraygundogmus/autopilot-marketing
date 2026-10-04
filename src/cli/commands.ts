@@ -1,12 +1,14 @@
 import os from 'node:os';
+import type { ChatClient } from '../agent/chat';
 import { AutopilotError } from '../core/errors';
 import { DATASETS } from '../core/types';
-import type { ApplyOutcome, DatasetName, Plan, Runtime, Snapshot } from '../core/types';
+import type { ApplyOutcome, DatasetName, Plan, Runtime, SecretStore, Snapshot } from '../core/types';
 import { auditSnapshot } from '../ops/audit';
 import { kpiReport, takeSnapshot } from '../ops/data';
 import { proposePlan, runCycle } from '../ops/plans';
 import { isInteractive } from '../plan/approval';
-import { applyPlan, createRevertPlan } from '../plan/executor';
+import { reconcileSentences } from '../jobs/reconcile';
+import { applyPlan, createRevertPlan, reconcileAccount } from '../plan/executor';
 import { previewPlan } from '../plan/preview';
 import { renderAudit, renderKpiReport } from '../report/render';
 import type { CliIo } from './main';
@@ -19,6 +21,12 @@ export interface CommandContext {
   args: string[];
   flags: Record<string, string | boolean | string[] | undefined>;
   json: boolean;
+  /** Replaces the operating system's credential store in tests. */
+  secrets?: SecretStore;
+  /** Replaces the model endpoint of the local runner in tests. */
+  chat?: ChatClient;
+  /** Ends a `schedule run --watch` loop in tests. */
+  signal?: AbortSignal;
 }
 
 export type CommandHandler = (ctx: CommandContext) => Promise<number>;
@@ -34,6 +42,7 @@ const USAGE: Record<string, string> = {
   apply: 'autopilot-marketing apply <planId> [--live] [--receipt id]',
   revert: 'autopilot-marketing revert <planId>',
   run: 'autopilot-marketing run <accountId> [--days N]',
+  reconcile: 'autopilot-marketing reconcile <accountId>',
 };
 
 function usageOf(command: string): string {
@@ -346,7 +355,15 @@ const run: CommandHandler = async (ctx) => {
   return result.outcome !== null && (result.outcome.failed > 0 || result.outcome.unknown > 0) ? 1 : 0;
 };
 
-/** snapshot, audit, report, plan, preview, approve, review, apply, revert, run. */
+const reconcile: CommandHandler = async (ctx) => {
+  const account = ctx.runtime.account(positional(ctx, 'reconcile', 'accountId'));
+  const summary = await reconcileAccount(ctx.runtime, account.id, { kind: 'human', id: os.userInfo().username });
+  const sentences = reconcileSentences(summary);
+  emit(ctx, summary, sentences.length > 0 ? sentences.join('\n') : 'Nothing to settle: no change is left with an unknown outcome.');
+  return summary.conflicts.length > 0 ? 1 : 0;
+};
+
+/** snapshot, audit, report, plan, preview, approve, review, apply, revert, run, reconcile. */
 export const workCommands: Record<string, CommandHandler> = {
   snapshot,
   audit,
@@ -358,4 +375,5 @@ export const workCommands: Record<string, CommandHandler> = {
   apply,
   revert,
   run,
+  reconcile,
 };

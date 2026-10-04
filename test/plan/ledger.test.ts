@@ -14,6 +14,7 @@ const paths: Paths = {
   brief: '/nonexistent/apm/brief.md',
   approvalKey: '/nonexistent/apm/approval.key',
   killFile: '/nonexistent/apm/KILL',
+  credentials: '/nonexistent/apm/credentials.json',
 };
 
 const actor = { kind: 'system', id: 'test' } as const;

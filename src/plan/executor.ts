@@ -8,6 +8,7 @@ import type {
   AccountConfig, Action, ActionDraft, ActionResult, ApplyOutcome, ApprovalReceipt, Connector, DatasetName,
   EntityLevel, GateDecision, JsonObject, JsonValue, LedgerEntry, LedgerInput, Plan, Runtime, Snapshot,
 } from '../core/types';
+import { judgeFor } from '../judgment/sharing';
 import { withJudgmentUsage } from '../judgment/usage';
 import { actionSpec, planDigest } from './actions';
 import { createPlan } from './planner';
@@ -22,11 +23,39 @@ export interface ApplyOptions {
   /** Set by the MCP tool when the human confirmed through client elicitation. */
   elicitedBy?: string;
   reviewDigest?: string;
+  /** Called before every platform write, in addition to the lock check. Throws when the caller may no longer write (a scheduled job that lost its claim). */
+  guard?: () => void;
+}
+
+export interface ReconcileSummary {
+  /** Intents without a recorded result that were settled now. */
+  reconciled: number;
+  applied: number;
+  notApplied: number;
+  /** Entities whose state matches neither the recorded before nor after: a person must look. */
+  conflicts: string[];
+  /** Plans whose stored status or action statuses were repaired from the ledger. */
+  repairedPlans: string[];
 }
 
 const STALE = 'stale: the entity changed since the plan was created';
+const LOCK_TTL_SECONDS = 900;
 type ExecutionResult = ApplyOutcome['results'][number];
 type Append = (entry: LedgerInput) => void;
+
+function acquireAccountLock(runtime: Runtime, accountId: string, executionId: string): (now?: Date) => boolean {
+  let extendedAt = runtime.now().getTime();
+  if (!runtime.store.acquireLock(accountId, executionId, new Date(extendedAt), LOCK_TTL_SECONDS)) {
+    throw new AutopilotError('stale_state', 'Another execution is running for this account.', { retryable: true });
+  }
+  return (now = runtime.now()) => {
+    // An expired lease may have had another owner even if it is available again now.
+    if (now.getTime() >= extendedAt + LOCK_TTL_SECONDS * 1000
+      || !runtime.store.acquireLock(accountId, executionId, now, LOCK_TTL_SECONDS)) return false;
+    extendedAt = now.getTime();
+    return true;
+  };
+}
 
 function errorDetails(error: unknown, runtime: Runtime): NonNullable<ActionResult['error']> {
   const record = typeof error === 'object' && error !== null ? error : {};
@@ -130,21 +159,10 @@ function intentDraft(data: JsonObject | undefined): ActionDraft | null {
   };
 }
 
-function reconcilePlan(
-  intent: LedgerEntry, runtime: Runtime, accountId: string,
+function reconcileAction(
+  action: Action,
   outcome: 'applied' | 'not_applied' | 'conflict', observed: JsonObject | null,
 ): void {
-  if (intent.planId === undefined || intent.actionId === undefined) return;
-  let original: Plan;
-  try {
-    original = runtime.store.getPlan(intent.planId);
-  } catch (error) {
-    if (error instanceof AutopilotError && error.code === 'not_found') return;
-    throw error;
-  }
-  if (original.accountId !== accountId) return;
-  const action = original.actions.find((candidate) => candidate.id === intent.actionId);
-  if (action === undefined) return;
   action.status = outcome === 'applied' ? 'applied' : outcome === 'not_applied' ? 'failed' : 'unknown';
   if (outcome === 'applied') {
     const { error: _error, ...result } = action.result ?? {};
@@ -152,18 +170,42 @@ function reconcilePlan(
   } else {
     action.result = { ...action.result, ok: false, dryRun: false, after: null };
   }
-  finalizePlan(original, runtime);
+}
+
+function reconcilePlan(
+  intent: LedgerEntry, runtime: Runtime, accountId: string,
+  outcome: 'applied' | 'not_applied' | 'conflict', observed: JsonObject | null, finalizePending: boolean,
+): string | null {
+  if (intent.planId === undefined || intent.actionId === undefined) return null;
+  let original: Plan;
+  try {
+    original = runtime.store.getPlan(intent.planId);
+  } catch (error) {
+    if (error instanceof AutopilotError && error.code === 'not_found') return null;
+    throw error;
+  }
+  if (original.accountId !== accountId) return null;
+  const action = original.actions.find((candidate) => candidate.id === intent.actionId);
+  if (action === undefined) return null;
+  const previousPlanStatus = original.status;
+  const previousActionStatus = action.status;
+  reconcileAction(action, outcome, observed);
+  if (finalizePending || original.actions.every((item) => item.status !== 'pending')) finalizePlan(original, runtime);
+  else runtime.store.savePlan(original);
+  return original.status === previousPlanStatus && action.status === previousActionStatus ? null : original.id;
 }
 
 async function reconcileIntents(
-  plan: Plan, runtime: Runtime, connector: Connector, actor: LedgerEntry['actor'], append: Append,
-): Promise<void> {
-  const entries = runtime.ledger.read({ accountId: plan.accountId });
+  accountId: string, runtime: Runtime, connector: Connector, actor: LedgerEntry['actor'], append: Append,
+  checkLock: () => void, plan?: Plan,
+): Promise<ReconcileSummary> {
+  const summary: ReconcileSummary = { reconciled: 0, applied: 0, notApplied: 0, conflicts: [], repairedPlans: [] };
+  const entries = runtime.ledger.read({ accountId });
   const intents = entries.filter((entry) => entry.event === 'action.intent' && !entries.some((later) =>
     later.seq > entry.seq && later.executionId === entry.executionId && later.actionId === entry.actionId
       && resolved(later)));
-  const conflicts: string[] = [];
   for (const intent of intents) {
+    checkLock();
     const draft = intentDraft(intent.data);
     const after = object(intent.data?.after);
     const before = object(intent.data?.before);
@@ -181,10 +223,12 @@ async function reconcileIntents(
     } else {
       reason = 'The recorded intent cannot be read safely.';
     }
+    checkLock();
     // A resolved ledger entry must not precede repair of the original plan.
-    reconcilePlan(intent, runtime, plan.accountId, outcome, observed);
+    const repaired = reconcilePlan(intent, runtime, accountId, outcome, observed, plan !== undefined);
+    if (repaired !== null && !summary.repairedPlans.includes(repaired)) summary.repairedPlans.push(repaired);
     append({
-      event: 'action.reconciled', actor, accountId: plan.accountId,
+      event: 'action.reconciled', actor, accountId,
       ...(intent.planId === undefined ? {} : { planId: intent.planId }),
       ...(intent.executionId === undefined ? {} : { executionId: intent.executionId }),
       ...(intent.actionId === undefined ? {} : { actionId: intent.actionId }),
@@ -198,14 +242,77 @@ async function reconcileIntents(
     });
     const target = object(intent.data?.target);
     const unidentified = target === null || typeof target.level !== 'string' || typeof target.id !== 'string';
-    if (outcome === 'conflict' && (unidentified || plan.actions.some((action) =>
-      action.target.level === target.level && action.target.id === target.id))) {
-      conflicts.push(unidentified ? 'an unidentified entity' : `${String(target.level)} ${String(target.id)}`);
+    if (outcome !== 'conflict') {
+      summary.reconciled += 1;
+      if (outcome === 'applied') summary.applied += 1;
+      else summary.notApplied += 1;
+    } else if (plan === undefined || unidentified || plan.actions.some((action) =>
+      action.target.level === target.level && action.target.id === target.id)) {
+      summary.conflicts.push(unidentified ? 'an unidentified entity' : `${String(target.level)} ${String(target.id)}`);
     }
   }
-  if (conflicts.length > 0) {
-    throw new AutopilotError('stale_state',
-      `A previous change to ${conflicts.join(', ')} has an unknown outcome; a person must check it before another change.`);
+  return summary;
+}
+
+function repairPlanFromLedger(plan: Plan, entries: LedgerEntry[], runtime: Runtime): boolean {
+  if (entries.length === 0) return false;
+  const before = digest(plan);
+  const latest = new Map<string, LedgerEntry>();
+  for (const entry of entries) {
+    if (entry.actionId === undefined || !resolved(entry)) continue;
+    if ((latest.get(entry.actionId)?.seq ?? 0) < entry.seq) latest.set(entry.actionId, entry);
+  }
+  for (const action of plan.actions) {
+    const entry = latest.get(action.id);
+    if (entry === undefined) continue;
+    const applied = entry.event === 'action.applied'
+      || (entry.event === 'action.reconciled' && entry.data?.outcome === 'applied');
+    const status = entry.event === 'action.skipped' ? 'skipped' : applied ? 'applied' : 'failed';
+    if (action.status === status) continue;
+    if (entry.event === 'action.skipped') {
+      action.status = 'skipped';
+      delete action.result;
+    } else {
+      reconcileAction(action, applied ? 'applied' : 'not_applied', applied ? object(entry.data?.after) ?? action.after : null);
+      if (!applied && entry.data?.error !== undefined && action.result !== undefined) {
+        action.result.error = errorDetails(entry.data.error, runtime);
+      }
+    }
+  }
+  if (plan.actions.every((action) => action.status !== 'pending')) finalizePlan(plan, runtime);
+  else if (digest(plan) !== before) runtime.store.savePlan(plan);
+  return digest(plan) !== before;
+}
+
+export async function reconcileAccount(
+  runtime: Runtime, accountId: string, actor: LedgerEntry['actor'],
+): Promise<ReconcileSummary> {
+  const account = runtime.account(accountId);
+  const executionId = `exec_${randomBytes(8).toString('hex')}`;
+  const extendLock = acquireAccountLock(runtime, account.id, executionId);
+  const checkLock = () => {
+    if (!extendLock()) {
+      throw new AutopilotError('stale_state', 'The execution lock was lost during reconciliation.', { retryable: true });
+    }
+  };
+  try {
+    // Intent settlement can finalize a plan before its other recorded results are repaired.
+    const unfinished = runtime.store.listPlans({ accountId: account.id })
+      .filter((plan) => plan.status === 'proposed' || plan.status === 'approved' || plan.status === 'applying');
+    const summary = await reconcileIntents(
+      account.id, runtime, runtime.connector(account), actor, (entry) => { runtime.ledger.append(entry); }, checkLock,
+    );
+    const entries = runtime.ledger.read({ accountId: account.id });
+    for (const original of unfinished) {
+      checkLock();
+      const repaired = repairPlanFromLedger(
+        runtime.store.getPlan(original.id), entries.filter((entry) => entry.planId === original.id), runtime,
+      );
+      if (repaired && !summary.repairedPlans.includes(original.id)) summary.repairedPlans.push(original.id);
+    }
+    return summary;
+  } finally {
+    runtime.store.releaseLock(account.id, executionId);
   }
 }
 
@@ -262,7 +369,7 @@ export async function applyPlan(planId: string, runtime: Runtime, options: Apply
       const asked = await withJudgmentUsage(
         runtime,
         { operation: 'gate', accountId: account.id, planId: plan.id },
-        () => runtime.judge.gatePlan({ plan, policy: runtime.config.policy, findings: [] }),
+        () => judgeFor(runtime, account).gatePlan({ plan, policy: runtime.config.policy, findings: [] }),
       );
       gate = asked.value;
     } catch {
@@ -288,9 +395,7 @@ export async function applyPlan(planId: string, runtime: Runtime, options: Apply
   }
   let receiptExpiresAt = Number.NaN;
   const executionId = `exec_${randomBytes(8).toString('hex')}`;
-  if (!runtime.store.acquireLock(account.id, executionId, runtime.now(), 900)) {
-    throw new AutopilotError('stale_state', 'Another execution is running for this account.', { retryable: true });
-  }
+  const extendLock = acquireAccountLock(runtime, account.id, executionId);
   const ledgerSeqs: number[] = [];
   const append: Append = (entry) => { ledgerSeqs.push(runtime.ledger.append(entry).seq); };
   const base = { actor: options.actor, accountId: account.id, planId: plan.id, executionId };
@@ -313,6 +418,15 @@ export async function applyPlan(planId: string, runtime: Runtime, options: Apply
     if (!(runtime.now().getTime() <= receiptExpiresAt)) return 'the approval receipt expired';
     return null;
   }
+  function writeStopReason(): string | null {
+    if (!extendLock()) return 'the execution lock was lost';
+    try {
+      options.guard?.();
+    } catch (error) {
+      return `the job claim was lost: ${errorDetails(error, runtime).message}`;
+    }
+    return null;
+  }
 
   try {
     // Gate calls can yield while another execution finishes this plan.
@@ -320,7 +434,15 @@ export async function applyPlan(planId: string, runtime: Runtime, options: Apply
     assertDigest(stored);
     assertExecutable(stored);
     if (stored.digest !== plan.digest) throw new AutopilotError('stale_state', 'The stored plan changed during authorization.');
-    await reconcileIntents(plan, runtime, connector, options.actor, append);
+    const reconciliation = await reconcileIntents(account.id, runtime, connector, options.actor, append, () => {
+      if (!extendLock()) {
+        throw new AutopilotError('stale_state', 'The execution lock was lost during reconciliation.', { retryable: true });
+      }
+    }, plan);
+    if (reconciliation.conflicts.length > 0) {
+      throw new AutopilotError('stale_state',
+        `A previous change to ${reconciliation.conflicts.join(', ')} has an unknown outcome; a person must check it before another change.`);
+    }
     assertExecutable(runtime.store.getPlan(plan.id));
     // The first evaluation ran before the lock: another execution may have used up a limit since.
     const underLock = evaluatePolicy({
@@ -336,7 +458,7 @@ export async function applyPlan(planId: string, runtime: Runtime, options: Apply
     if (automatic && (!underLock.autoApplicable || gate === null || !gateAllows(gate, plan, runtime.config.judgment.gateThreshold))) {
       throw new AutopilotError('approval_required', 'Automatic authorization no longer allows this plan. Human approval is required.');
     }
-    if (!runtime.store.acquireLock(account.id, executionId, claimTime, 900)) {
+    if (!extendLock(claimTime)) {
       throw new AutopilotError('stale_state', 'The execution lock was lost before claiming approval.', { retryable: true });
     }
     if (receipt === undefined) {
@@ -360,11 +482,7 @@ export async function applyPlan(planId: string, runtime: Runtime, options: Apply
 
     for (const [index, action] of plan.actions.entries()) {
       try {
-        let reason = stopReason();
-        // Re-taking the lock extends it; losing it means another execution took over after an expiry.
-        if (reason === null && !runtime.store.acquireLock(account.id, executionId, runtime.now(), 900)) {
-          reason = 'the execution lock was lost';
-        }
+        let reason = stopReason() ?? writeStopReason();
         if (reason !== null) { skip(plan.actions.slice(index), reason); break; }
         let fresh: JsonObject;
         try {
@@ -374,7 +492,7 @@ export async function applyPlan(planId: string, runtime: Runtime, options: Apply
           continue;
         }
         if (digest(fresh) !== action.preconditionHash) { skip([action], STALE); continue; }
-        reason = stopReason();
+        reason = stopReason() ?? writeStopReason();
         if (reason !== null) { skip(plan.actions.slice(index), reason); break; }
         const idempotencyKey = `${executionId}:${action.id}`;
         const actionBase = { ...base, actionId: action.id, idempotencyKey };
@@ -384,17 +502,29 @@ export async function applyPlan(planId: string, runtime: Runtime, options: Apply
           skip(plan.actions.slice(index), `the action intent could not be recorded: ${errorDetails(error, runtime).message}`);
           break;
         }
-        reason = stopReason();
+        reason = stopReason() ?? writeStopReason();
         if (reason !== null) { skip(plan.actions.slice(index), reason); break; }
         let result: ActionResult;
         let ambiguous = false;
+        let guardThrew = false;
+        const beforeWrite = () => {
+          const blocked = writeStopReason();
+          if (blocked !== null) {
+            guardThrew = true;
+            throw new AutopilotError('stale_state', blocked);
+          }
+        };
         // A dispatched mutation remains unknown until a result or a fresh read settles it.
         action.status = 'unknown';
         delete action.result;
         try {
-          result = await connector.apply(action, { validateOnly: false, idempotencyKey });
+          result = await connector.apply(action, { validateOnly: false, idempotencyKey, beforeWrite });
           ambiguous = !result.ok && result.error?.retryable === true;
         } catch (error) {
+          if (guardThrew) {
+            skip(plan.actions.slice(index), errorDetails(error, runtime).message);
+            break;
+          }
           result = failedResult(error, runtime);
           ambiguous = true;
         }

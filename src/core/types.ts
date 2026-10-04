@@ -128,6 +128,12 @@ export interface Snapshot {
    * 'purchase' or 'lead'). Two snapshots are comparable on conversions only when this is equal.
    */
   conversionDefinition?: string;
+  /**
+   * The attribution windows conversions were requested under, when the connector sets them
+   * (Meta: for example '7d_click,1d_view'). Two snapshots are comparable on conversions only when
+   * this is equal.
+   */
+  attribution?: string;
   /** sha256 of the canonical JSON of `datasets`. */
   contentHash: string;
 }
@@ -207,6 +213,21 @@ export interface AccountConfig {
   business?: string;
   /** Entity ids or name globs (`*brand*`) that no plan may touch. */
   protected?: string[];
+  sharing?: AccountSharing;
+}
+
+/** What may leave this machine for one account, beyond the calls to the ad platform itself. */
+export interface AccountSharing {
+  /**
+   * Default true. False: nothing stored for this account is sent to Jev. The audit, the judge tools
+   * and the gate use the labelled rule-based fallback for it, so nothing is applied automatically.
+   */
+  judgments?: boolean;
+  /**
+   * Default true. False: `data_query` and `evidence_get` return counts and totals for this account
+   * but no rows. Findings still quote the numbers and names they are about.
+   */
+  rows?: boolean;
 }
 
 export interface Policy {
@@ -302,6 +323,38 @@ export interface BusinessProfile {
   forbiddenPhrases?: string[];
 }
 
+export const JOB_TASKS = ['audit', 'cycle', 'report'] as const;
+export type JobTask = (typeof JOB_TASKS)[number];
+
+/** A recurring task, written by the person in the config. No tool creates or edits one. */
+export interface ScheduleConfig {
+  /** Local handle, unique among schedules. */
+  id: string;
+  accountId: string;
+  /**
+   * `audit`: snapshot and audit. `cycle`: snapshot, audit, plan, and apply only what autonomy,
+   * policy and gate allow. `report`: KPI report against the previous period.
+   */
+  task: JobTask;
+  /** Interval: a whole number and a unit, `15m` to `30d` (m, h, d). */
+  every: string;
+  /** `HH:MM` in the account's time zone (UTC when it has none). Only with an interval of whole days. */
+  at?: string;
+  /** Length of the date range in days. Default 30. */
+  days?: number;
+  /** Default true. */
+  enabled?: boolean;
+}
+
+/** Defaults of the local model runner (`autopilot-marketing agent`). */
+export interface LocalAgentConfig {
+  /** OpenAI-compatible base URL. Default `http://127.0.0.1:11434/v1` (Ollama). */
+  baseUrl?: string;
+  model?: string;
+  /** Default 12. */
+  maxSteps?: number;
+}
+
 export interface AutopilotConfig {
   version: 1;
   autonomy: Autonomy;
@@ -310,6 +363,8 @@ export interface AutopilotConfig {
   policy: Policy;
   judgment: JudgmentConfig;
   thresholds: Thresholds;
+  schedules?: ScheduleConfig[];
+  agent?: LocalAgentConfig;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -871,8 +926,38 @@ export interface Connector {
   fetchSnapshot(request: SnapshotRequest): Promise<Snapshot>;
   /** Current values of exactly the fields `draft` would change, in the same shape as `Action.before`. */
   readState(draft: ActionDraft): Promise<JsonObject>;
-  /** Performs one action. `validateOnly` asks the platform to validate without changing anything, where it can. */
-  apply(action: Action, options: { validateOnly: boolean; idempotencyKey: string }): Promise<ActionResult>;
+  /**
+   * Performs one action. `validateOnly` asks the platform to validate without changing anything,
+   * where it can. `beforeWrite` is called immediately before every request that changes the
+   * platform, after any read the connector makes first; it throws when this execution may no
+   * longer write (its lock or its job was taken over). The connector lets that error through and
+   * sends nothing.
+   */
+  apply(
+    action: Action,
+    options: { validateOnly: boolean; idempotencyKey: string; beforeWrite?: () => void },
+  ): Promise<ActionResult>;
+  /**
+   * Live connection checks, in the order a person would fix them. Makes network calls, changes
+   * nothing, never throws: a failed check is a result.
+   */
+  diagnose?(): Promise<DiagnosticCheck[]>;
+}
+
+export interface DiagnosticCheck {
+  /** Stable id, e.g. `oauth_token`, `account_access`. */
+  id: string;
+  /** What was checked, in a few words. */
+  label: string;
+  /**
+   * `unknown`: the check could not be completed (timeout, rate limit, server error), which says
+   * nothing about the configuration. `skipped`: an earlier check failed, so this one could not run.
+   */
+  status: 'ok' | 'fail' | 'unknown' | 'skipped';
+  /** What was found. Never contains a secret. */
+  detail: string;
+  /** What the person should do, when the check failed. */
+  fix?: string;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -934,6 +1019,8 @@ export interface Paths {
   approvalKey: string;
   /** Its existence turns the kill switch on. */
   killFile: string;
+  /** Names (never values) of the credentials kept in the operating system's credential store. */
+  credentials: string;
 }
 
 export interface HttpRequest {
@@ -1066,4 +1153,145 @@ export interface Runtime {
   account(accountId: string): AccountConfig;
   connector(account: AccountConfig): Connector;
   killSwitch(): boolean;
+  jobs: JobQueue;
+  /** Where credentials came from. Names only. */
+  credentials: CredentialSources;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Scheduled jobs
+// ---------------------------------------------------------------------------------------------
+
+/** `skipped`: never run, because a newer run replaced it or its schedule changed. */
+export type JobState = 'queued' | 'running' | 'succeeded' | 'failed' | 'skipped';
+
+/** What a finished job produced. Ids point into the store; nothing here is a full report. */
+export interface JobResult {
+  snapshotId?: string;
+  auditId?: string;
+  score?: number;
+  findings?: number;
+  planId?: string;
+  /** Changes applied under the auto-apply policy. */
+  applied?: number;
+  /** Changes of that plan that failed, were skipped, or whose outcome is not known. */
+  failed?: number;
+  skipped?: number;
+  unknown?: number;
+  /** What a person has to do next, if anything. */
+  next?: string;
+  /** One line a person can read. */
+  summary?: string;
+}
+
+export interface Job {
+  /** `job_` + 16 hex chars. For a scheduled run it is derived from the schedule id and the slot time. */
+  id: string;
+  /** Null for a job started by hand. */
+  scheduleId: string | null;
+  accountId: string;
+  task: JobTask;
+  state: JobState;
+  /** ISO time the job became due (the slot time of a scheduled run). Never changes. */
+  dueAt: string;
+  /** ISO time before which the job is not claimed: `dueAt`, or later after a failed attempt. */
+  runAfter: string;
+  /** Times the job was claimed. Together with `claimedBy` it identifies one attempt. */
+  attempts: number;
+  claimedBy: string | null;
+  claimedUntil: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  createdAt: string;
+  input: JobInput;
+  result?: JobResult;
+  /** Why the job failed, or why its last attempt failed. */
+  error?: string;
+  /** Why a person should look, decided by rules, not by a model. Empty when nothing stands out. */
+  attention: string[];
+}
+
+export interface JobInput {
+  /** Length of the date range in days. */
+  days: number;
+  /** Digest of the schedule and account the job was queued for; a job whose schedule changed since is skipped. */
+  fingerprint?: string;
+}
+
+export interface NewJob {
+  id: string;
+  scheduleId: string | null;
+  accountId: string;
+  task: JobTask;
+  dueAt: string;
+  input: JobInput;
+}
+
+export type JobOutcome =
+  | { state: 'succeeded'; result: JobResult; attention: string[] }
+  | { state: 'failed'; error: string; attention: string[]; result?: JobResult }
+  /** Not run at all. `reason` is stored as the job's error. */
+  | { state: 'skipped'; reason: string }
+  /** The attempt failed; the job goes back to the queue and is not claimed before `retryAt`. */
+  | { state: 'queued'; error: string; retryAt: string };
+
+/** A persistent queue in the state database. Every method is safe with several processes. */
+export interface JobQueue {
+  /** Inserts a queued job unless one with this id exists. True when it was inserted. */
+  enqueue(job: NewJob, now: Date): boolean;
+  /**
+   * Settles `running` jobs whose claim expired (their worker died or hung). `audit` and `report`
+   * go back to `queued` while `attempts < maxAttempts` (default 3) and fail after that; `cycle`
+   * becomes `failed` with an error starting with `interrupted`, because it may have written.
+   * Returns the jobs it changed.
+   */
+  reclaim(now: Date, maxAttempts?: number): Job[];
+  /**
+   * Atomically claims the queued job with the earliest `dueAt` among those whose `runAfter` is at
+   * or before `now`. Null when none is due.
+   */
+  claimDue(workerId: string, now: Date, ttlSeconds: number): Job | null;
+  /**
+   * Extends the claim of the attempt `job` describes (its id, `claimedBy` and `attempts`). False
+   * when that attempt no longer holds the job: the caller must stop working on it.
+   */
+  heartbeat(job: Job, now: Date, ttlSeconds: number): boolean;
+  /** Ends the attempt `job` describes. False (and nothing changes) when that attempt lost the job. */
+  finish(job: Job, now: Date, outcome: JobOutcome): boolean;
+  /** Throws `not_found`. */
+  get(id: string): Job;
+  /** Newest first by `dueAt`. Default limit 20, at most 200. */
+  list(filter?: { accountId?: string; scheduleId?: string; state?: JobState; limit?: number }): Job[];
+  /** The newest job of a schedule in any state, or null. */
+  latest(scheduleId: string): Job | null;
+  /** The newest `succeeded` job of a schedule that became due before `job`, or null. */
+  previousSucceeded(job: Job): Job | null;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Credentials
+// ---------------------------------------------------------------------------------------------
+
+/** `keychain`: macOS. `secret-service`: Linux (libsecret). `none`: no supported store on this system. */
+export type SecretStoreKind = 'keychain' | 'secret-service' | 'none';
+
+/** The operating system's credential store, reached through its own command line tool. */
+export interface SecretStore {
+  readonly kind: SecretStoreKind;
+  /** Separates the entries of one home directory from those of another. */
+  readonly profile: string;
+  /** Undefined when the store has no such entry. Throws `not_configured` when the store cannot be used. */
+  get(name: string): string | undefined;
+  /** Creates or replaces. Throws `not_configured` when the store cannot be used. */
+  set(name: string, value: string): void;
+  /** True when an entry was removed. */
+  delete(name: string): boolean;
+}
+
+export interface CredentialSources {
+  store: SecretStoreKind;
+  /** Names read from the store at start. */
+  fromStore: string[];
+  /** Names listed for the store that could not be read, with the reason. */
+  unreadable: Array<{ name: string; reason: string }>;
 }

@@ -339,3 +339,66 @@ describe('applyMetaAdsAction', () => {
     expect(requests).toHaveLength(0);
   });
 });
+
+describe('applyMetaAdsAction beforeWrite', () => {
+  function recording(): { deps: ConnectorDeps; requests: HttpRequest[]; events: string[] } {
+    const events: string[] = [];
+    const made = makeDeps((request) => {
+      events.push(request.method ?? 'GET');
+      return owned()(request);
+    });
+    return { ...made, events };
+  }
+
+  it('calls beforeWrite once, after the ownership read and directly before the POST', async () => {
+    const { deps, events } = recording();
+    const result = await applyMetaAdsAction(deps, action('meta_ads.campaign.pause'), {
+      ...OPTIONS,
+      beforeWrite: () => void events.push('beforeWrite'),
+    });
+    expect(result.ok).toBe(true);
+    expect(events).toEqual(['GET', 'beforeWrite', 'POST']);
+  });
+
+  it('lets a beforeWrite error through unchanged and sends no POST', async () => {
+    for (const refusal of [new Error('lock lost'), new AutopilotError('platform_error', 'taken over')]) {
+      const { deps, requests } = recording();
+      const pending = applyMetaAdsAction(deps, action('meta_ads.campaign.pause'), {
+        ...OPTIONS,
+        beforeWrite: () => {
+          throw refusal;
+        },
+      });
+      await expect(pending).rejects.toBe(refusal);
+      expect(requests.filter((request) => request.method === 'POST')).toHaveLength(0);
+      expect(requests.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('never calls beforeWrite on validateOnly', async () => {
+    const { deps, requests } = recording();
+    let called = 0;
+    const result = await applyMetaAdsAction(deps, action('meta_ads.campaign.pause'), {
+      validateOnly: true,
+      idempotencyKey: 'key-1',
+      beforeWrite: () => {
+        called += 1;
+      },
+    });
+    expect(result).toMatchObject({ ok: true, dryRun: true });
+    expect(called).toBe(0);
+    expect(requests.filter((request) => request.method === 'POST')).toHaveLength(1);
+  });
+
+  it('sends the same requests with and without beforeWrite', async () => {
+    const without = recording();
+    const withGuard = recording();
+    const a = await applyMetaAdsAction(without.deps, action('meta_ads.campaign.pause'), OPTIONS);
+    const b = await applyMetaAdsAction(withGuard.deps, action('meta_ads.campaign.pause'), {
+      ...OPTIONS,
+      beforeWrite: () => undefined,
+    });
+    expect(a).toEqual(b);
+    expect(without.requests).toEqual(withGuard.requests);
+  });
+});

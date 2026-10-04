@@ -37,8 +37,15 @@ function draftParams(draft: ActionDraft): { name: string; subject: string; html:
   return { name, subject, html };
 }
 
-async function send(deps: ConnectorDeps, path: string, init: Omit<HttpRequest, 'url'>): Promise<JsonValue> {
+/** `beforeWrite` is given for a request that changes Mautic; it runs after the request is built, directly before it is sent. */
+async function send(
+  deps: ConnectorDeps,
+  path: string,
+  init: Omit<HttpRequest, 'url'>,
+  beforeWrite?: () => void,
+): Promise<JsonValue> {
   const request = await mauticRequest(deps, path, init);
+  beforeWrite?.();
   const response = await deps.http.request(request);
   return response.body;
 }
@@ -187,16 +194,18 @@ export async function readMauticState(deps: ConnectorDeps, draft: ActionDraft): 
   }
 }
 
-async function applyLive(deps: ConnectorDeps, action: Action): Promise<ActionResult> {
+async function applyLive(deps: ConnectorDeps, action: Action, beforeWrite: () => void): Promise<ActionResult> {
   switch (action.kind) {
     case 'mautic.segment.add_contact':
     case 'mautic.segment.remove_contact': {
       const { segmentId, contactId } = segmentIds(action);
       const adding = action.kind === 'mautic.segment.add_contact';
-      await send(deps, `/segments/${segmentId}/contact/${contactId}/${adding ? 'add' : 'remove'}`, {
-        method: 'POST',
-        retry: false,
-      });
+      await send(
+        deps,
+        `/segments/${segmentId}/contact/${contactId}/${adding ? 'add' : 'remove'}`,
+        { method: 'POST', retry: false },
+        beforeWrite,
+      );
       return { ok: true, dryRun: false, after: { member: adding }, resource: segmentId };
     }
     case 'mautic.email.create_draft': {
@@ -213,11 +222,16 @@ async function applyLive(deps: ConnectorDeps, action: Action): Promise<ActionRes
         if (found.id !== null) result.resource = found.id;
         return result;
       }
-      const body = await send(deps, '/emails/new', {
-        method: 'POST',
-        retry: false,
-        json: { name, subject, customHtml: html, emailType: 'template', isPublished: false },
-      });
+      const body = await send(
+        deps,
+        '/emails/new',
+        {
+          method: 'POST',
+          retry: false,
+          json: { name, subject, customHtml: html, emailType: 'template', isPublished: false },
+        },
+        beforeWrite,
+      );
       const email = isRecord(body) ? body['email'] : undefined;
       const id = isRecord(email) ? email['id'] : undefined;
       if (typeof id !== 'string' && typeof id !== 'number') {
@@ -235,17 +249,28 @@ async function applyLive(deps: ConnectorDeps, action: Action): Promise<ActionRes
 export async function applyMauticAction(
   deps: ConnectorDeps,
   action: Action,
-  options: { validateOnly: boolean; idempotencyKey: string },
+  options: { validateOnly: boolean; idempotencyKey: string; beforeWrite?: () => void },
 ): Promise<ActionResult> {
   const dryRun = options.validateOnly;
+  // An error thrown by `beforeWrite` leaves this function unchanged: it is never reported as a result.
+  let refusal: { error: unknown } | undefined;
+  const beforeWrite = (): void => {
+    try {
+      options.beforeWrite?.();
+    } catch (error) {
+      refusal = { error };
+      throw error;
+    }
+  };
   try {
     if (dryRun) {
       // Mautic has no validate-only mode: a dry run only proves the target can be read.
       await readMauticState(deps, action);
       return { ok: true, dryRun: true, after: null };
     }
-    return await applyLive(deps, action);
+    return await applyLive(deps, action, beforeWrite);
   } catch (error) {
+    if (refusal !== undefined && refusal.error === error) throw error;
     const failure = toAutopilotError(error);
     if (failure.retryable && !dryRun) throw failure;
     return {

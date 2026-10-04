@@ -262,6 +262,60 @@ describe('fetchGoogleAdsSnapshot', () => {
     expect(snapshot.warnings).toHaveLength(1);
   });
 
+  it('selects the attribution settings of each conversion action', async () => {
+    const { deps, calls } = setup();
+    await fetchGoogleAdsSnapshot(deps, { account, dateRange: range, datasets: ['conversion_actions'] });
+    const query = calls
+      .map((call) => (call.json as { query: string }).query)
+      .find((text) => text.endsWith('FROM conversion_action'));
+    expect(query).toContain('conversion_action.attribution_model_settings.attribution_model');
+    expect(query).toContain('conversion_action.click_through_lookback_window_days');
+    expect(query).toContain('conversion_action.view_through_lookback_window_days');
+    expect(query).toContain('conversion_action.counting_type');
+    expect(query).not.toContain('segments.date');
+  });
+
+  it('records the attribution model and lookback windows as attrs', async () => {
+    const action = (extra: Record<string, JsonValue>): JsonValue => ({
+      conversionAction: { id: '51', name: 'Signup', status: 'ENABLED', countingType: 'ONE_PER_CLICK', ...extra },
+    });
+    const responder: Responder = (query) =>
+      resourceOf(query) === 'conversion_action'
+        ? [
+            {
+              results: [
+                action({
+                  attributionModelSettings: { attributionModel: 'GOOGLE_SEARCH_ATTRIBUTION_DATA_DRIVEN' },
+                  clickThroughLookbackWindowDays: '30',
+                  viewThroughLookbackWindowDays: 1,
+                }),
+                { ...(action({ id: '52', clickThroughLookbackWindowDays: 'n/a', attributionModelSettings: {} }) as object) },
+              ],
+            },
+          ]
+        : defaultResponder(query);
+    const { deps } = setup(responder);
+    const snapshot = await fetchGoogleAdsSnapshot(deps, { account, dateRange: range, datasets: ['conversion_actions'] });
+    const rows = snapshot.datasets.conversion_actions ?? [];
+    expect(rows[0]?.attrs).toEqual({
+      status: 'ENABLED',
+      type: null,
+      category: null,
+      primary: false,
+      countingType: 'ONE_PER_CLICK',
+      attributionModel: 'GOOGLE_SEARCH_ATTRIBUTION_DATA_DRIVEN',
+      clickLookbackDays: 30,
+      viewLookbackDays: 1,
+    });
+    expect(typeof rows[0]?.attrs['clickLookbackDays']).toBe('number');
+    expect(rows[1]?.id).toBe('52');
+    expect(rows[1]?.attrs).toEqual({ status: 'ENABLED', type: null, category: null, primary: false, countingType: 'ONE_PER_CLICK' });
+    expect('attributionModel' in (rows[1]?.attrs ?? {})).toBe(false);
+    expect('clickLookbackDays' in (rows[1]?.attrs ?? {})).toBe(false);
+    expect('viewLookbackDays' in (rows[1]?.attrs ?? {})).toBe(false);
+    expect('attribution' in snapshot).toBe(false);
+  });
+
   it('rejects an invalid range before any request', async () => {
     const { deps, calls } = setup();
     await expect(

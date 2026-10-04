@@ -402,3 +402,67 @@ describe('applyGoogleAdsAction', () => {
     });
   });
 });
+
+describe('applyGoogleAdsAction beforeWrite', () => {
+  const budgetRow = (): { body: JsonValue } =>
+    rows({
+      campaign: { status: 'ENABLED', campaignBudget: 'customers/1234567890/campaignBudgets/9' },
+      campaignBudget: { amountMicros: '5000000', explicitlyShared: false },
+    });
+
+  function recording(): { deps: ConnectorDeps; calls: HttpRequest[]; events: string[] } {
+    const events: string[] = [];
+    const made = makeDeps((request) => {
+      events.push(isSearch(request) ? 'read' : 'write');
+      return isSearch(request) ? budgetRow() : { body: { results: [{ resourceName: 'r' }] } };
+    });
+    return { ...made, events };
+  }
+
+  it('calls beforeWrite once, after the read and directly before the mutate', async () => {
+    const { deps, events } = recording();
+    const result = await applyGoogleAdsAction(
+      deps,
+      action('google_ads.campaign.set_daily_budget', 'campaign', '42', { dailyBudget: 20 }),
+      { ...LIVE, beforeWrite: () => void events.push('beforeWrite') },
+    );
+    expect(result.ok).toBe(true);
+    expect(events).toEqual(['read', 'beforeWrite', 'write']);
+  });
+
+  it('lets a beforeWrite error through unchanged and sends no mutate', async () => {
+    for (const refusal of [new Error('lock lost'), new AutopilotError('platform_error', 'taken over')]) {
+      const { deps, calls } = recording();
+      const pending = applyGoogleAdsAction(deps, action('google_ads.campaign.pause', 'campaign', '42'), {
+        ...LIVE,
+        beforeWrite: () => {
+          throw refusal;
+        },
+      });
+      await expect(pending).rejects.toBe(refusal);
+      expect(calls.filter((call) => !isSearch(call))).toHaveLength(0);
+    }
+  });
+
+  it('never calls beforeWrite on validateOnly', async () => {
+    const { deps, calls } = recording();
+    const beforeWrite = vi.fn();
+    const result = await applyGoogleAdsAction(deps, action('google_ads.campaign.pause', 'campaign', '42'), {
+      ...DRY,
+      beforeWrite,
+    });
+    expect(result).toMatchObject({ ok: true, dryRun: true });
+    expect(beforeWrite).not.toHaveBeenCalled();
+    expect(calls.filter((call) => !isSearch(call))).toHaveLength(1);
+  });
+
+  it('sends the same requests with and without beforeWrite', async () => {
+    const without = recording();
+    const withGuard = recording();
+    const act = action('google_ads.campaign.pause', 'campaign', '42');
+    const a = await applyGoogleAdsAction(without.deps, act, LIVE);
+    const b = await applyGoogleAdsAction(withGuard.deps, act, { ...LIVE, beforeWrite: () => undefined });
+    expect(a).toEqual(b);
+    expect(without.calls).toEqual(withGuard.calls);
+  });
+});

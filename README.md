@@ -9,6 +9,9 @@ autopilot-marketing is an open-source ad operations engine for your own AI agent
 - **KPI reports.** Period-over-period numbers with facts that can be recomputed from the stored data.
 - **Reviewable change plans.** A plan is a stored list of typed actions with the current state of each target recorded. Creating a plan changes nothing.
 - **Guarded execution.** Policy limits, an approval bound to the plan digest, a fresh-state check before each change, an append-only ledger, and compensating reverts.
+- **Scheduled checks.** Schedules you write in the config run audits, reports and cycles on this machine, and rules (not a model) decide when a run needs your attention.
+- **Your data, your limits.** Per account you decide whether anything goes to Jev and whether an agent may read rows at all. Credentials can live in the operating system's credential store.
+- **A local model if you want one.** The same tools work with a model served on this machine, with less authority than your own agent gets.
 - **A keyless demo and CSV import.** Demo accounts work without credentials, and CSV exports can be imported instead of calling an API.
 
 ## Try it in two minutes
@@ -67,7 +70,7 @@ Approval is given by the person with `autopilot-marketing approve <planId>` or `
 
 ## Tools
 
-The MCP server exposes 14 tools. Clients add their own prefix to these names.
+The MCP server exposes 15 tools. Clients add their own prefix to these names.
 
 | Tool | What it does |
 | --- | --- |
@@ -85,8 +88,9 @@ The MCP server exposes 14 tools. Clients add their own prefix to these names.
 | `plan_apply` | A dry run by default. A live run executes only a stored, policy-passing plan with an approval given by a person outside the conversation, or inside the owner's auto-apply policy. |
 | `plan_revert` | Creates a new compensating plan for an applied plan. It needs its own preview and approval. |
 | `ledger_list` | Reads the append-only change log and reports its integrity. |
+| `jobs_list` | Lists the owner's schedules and the recent scheduled runs, with their results and the reasons a person should look. No tool creates, changes or starts a schedule. |
 
-The command line program `autopilot-marketing` has these commands: `init`, `doctor`, `snapshot`, `audit`, `report`, `plan`, `preview`, `approve`, `review`, `apply`, `revert`, `run`, `ledger`, `kill` and `mcp`. `kill` turns on the kill switch, which refuses every live change, and `mcp` starts the MCP server.
+The command line program `autopilot-marketing` has these commands: `init`, `doctor`, `credentials`, `snapshot`, `audit`, `report`, `plan`, `preview`, `approve`, `review`, `apply`, `revert`, `run`, `schedule`, `jobs`, `reconcile`, `agent`, `ledger`, `kill` and `mcp`. `kill` turns on the kill switch, which refuses every live change, and `mcp` starts the MCP server. Every command takes `--json` for output a script can read.
 
 ## Connecting real accounts
 
@@ -127,7 +131,87 @@ Credentials are read from these variables:
 
 Google retired developer tokens on 2026-09-09. Access to the Google Ads API now follows the Google Cloud project that owns the OAuth credentials.
 
+Credentials do not have to sit in a file. `autopilot-marketing credentials set GOOGLE_REFRESH_TOKEN` reads the value from a hidden prompt (or from a pipe) and keeps it in the macOS keychain or, on Linux, in the Secret Service through `secret-tool`. On other systems use the `.env` file. A value in the process environment wins over the credential store, which wins over `.env`. A credential that is registered in the store but cannot be read (a locked keychain, for example) is treated as missing; it is never replaced by a value from `.env` or by another account's credential.
+
+`autopilot-marketing doctor --connect` tests the connection of every account with real calls and names the fix for what fails: an expired refresh token, a missing scope, an API that is not enabled, a Google Cloud project with Test access only, a customer that is reachable only through a manager account, a Meta token without `ads_read`, an ad account the user cannot reach. It reports what it tested. Read access is tested; write access is not. Google does not expose a project's access level through the API, and Meta's access tier is separate from the permissions of a token: the check prints what Meta reports and does not guess.
+
 If you do not want to connect an API, export CSV files from the platform and pass them to `snapshot_create` in `csvFiles`. A snapshot built from CSV can be audited and reported on without any credentials. Changes still need API access, because the current state of every target is read from the platform before a plan is stored and again before it is applied. Demo accounts simulate changes on this machine; nothing leaves it.
+
+## Scheduling
+
+Schedules are written by you in `config.json`. No tool creates, changes or starts one.
+
+```json
+{
+  "schedules": [
+    { "id": "daily-audit", "accountId": "acme-google", "task": "audit", "every": "1d", "at": "07:30" },
+    { "id": "weekly-report", "accountId": "acme-google", "task": "report", "every": "7d" }
+  ]
+}
+```
+
+`task` is `audit` (snapshot and audit), `report` (KPI report against the previous period) or `cycle` (audit, plan, and apply only what the autonomy level, the policy and the Jev gate allow). `every` is `15m` to `30d`. `at` is a time of day in the account's time zone and needs an interval in whole days.
+
+Nothing runs by itself: `autopilot-marketing schedule run` runs what is due and exits, so it fits cron, launchd or a systemd timer, and `schedule run --watch` keeps running in a terminal.
+
+```
+*/15 * * * * autopilot-marketing schedule run
+```
+
+- A run is stored in the state database and survives a restart. Only the latest slot of a schedule is run; slots missed while the machine was off are not made up.
+- Several processes can run at once. A job is claimed by one of them, and a worker that was suspended cannot finish a job that another worker took over.
+- A failed audit or report is retried twice when the failure was temporary; a run whose snapshot came back empty counts as failed, not as a clean result. A cycle is never retried: the next slot starts from a fresh snapshot, after settling what an interrupted run left behind (`autopilot-marketing reconcile <accountId>` does the same by hand).
+- Rules decide whether a run needs your attention: a new critical or high finding, a score that fell by 10 points, a new tracking problem, a plan waiting for approval, a change that failed or whose outcome is unknown, a run that failed. `autopilot-marketing jobs` and the `jobs_list` tool show the runs and the reasons.
+- `schedule run` exits with 3 when a run needs attention, 1 when a run failed, and 0 otherwise.
+
+autopilot-marketing does not start an agent for you. A script of your own can, when the exit code is 3. This starts Claude Code with the tools of this server only, no shell and no file access:
+
+```sh
+autopilot-marketing schedule run
+if [ $? -eq 3 ]; then
+  claude -p --mcp-config mcp.json --strict-mcp-config --tools "" \
+    --allowedTools "mcp__autopilot__*" --permission-mode dontAsk --max-turns 8 \
+    "Call jobs_list with attentionOnly true and summarise what needs my attention."
+fi
+```
+
+Here `mcp.json` is `{"mcpServers":{"autopilot":{"command":"npx","args":["-y","github:eraygundogmus/autopilot-marketing","mcp"]}}}`.
+
+When the computer is off or asleep nothing runs, and ads that are live keep running.
+
+## What leaves your machine
+
+The program, its database, the schedules, the reports and the change history stay on your machine, and there is no server of ours. Three things leave it:
+
+- **Calls to the ad platforms**, with your credentials.
+- **What your agent reads.** A tool result goes to whatever model your agent uses. Running the server locally does not make a cloud model local.
+- **Requests to Jev**, when `TYPESAFE_API_KEY` is set: search terms, ad copy, statements to verify and the actions of a plan, with the business description.
+
+Per account you can narrow this in `config.json`:
+
+```json
+{ "id": "acme-google", "platform": "google_ads", "externalId": "123-456-7890",
+  "sharing": { "judgments": false, "rows": false } }
+```
+
+- `"judgments": false`: nothing stored for this account is sent to Jev. Its audit, the judge tools and the gate use the labelled rule-based fallback, so nothing is applied automatically for it.
+- `"rows": false`: `data_query` and `evidence_get` return counts for this account and no rows, and `judge_terms` does not list the search terms of its snapshots. Findings and reports still quote the numbers and names they are about.
+
+Names in findings are not masked. Masking them reliably would need opaque identifiers everywhere and would hide the search terms and ad copy an agent is asked to review, so this version does not promise it.
+
+## Using a local model
+
+`autopilot-marketing agent` runs a task with a model served on this machine through an OpenAI-compatible endpoint, by default Ollama at `http://127.0.0.1:11434/v1`. The model gets the same tools through the same server.
+
+```sh
+autopilot-marketing agent "Audit demo-google and list the three most expensive findings." --model qwen3 --account demo-google
+```
+
+- The endpoint must be a loopback address written as a number (`127.0.0.1` or `[::1]`), and a model that Ollama serves from the cloud is refused. `--allow-remote` lifts both.
+- The model gets less authority than your own agent: it cannot go beyond `propose`, it sees only the accounts named with `--account`, it cannot import files, and judgments use the rule-based fallback instead of Jev. `--allow-apply` gives it the autonomy level of your config, and `--jev` allows Jev.
+- With Ollama, set `OLLAMA_NO_CLOUD=1` to turn its cloud features off.
+
+The runner is tested against a model server that follows the documented protocol, not against a real model. How well a small local model uses the tools depends on the model.
 
 ## Support matrix
 
@@ -154,6 +238,8 @@ What the server enforces:
 - **No blind retry.** When the outcome of a change cannot be confirmed, it is recorded as `unknown`, and that entity is blocked until a fresh read settles it.
 - **Hash-chained ledger.** Each ledger entry contains the hash of the one before it.
 - **Kill switch.** While it is on, every live change is refused.
+- **One execution per account.** A lock keeps two executions off the same account. It is checked again immediately before every request that changes the platform, after any read the connector makes first, so a process that was suspended past its lock, or a scheduled run that lost its job to another worker, does not write.
+- **Human-owned settings.** The autonomy level, the policy, the schedules and the sharing policy live in the config file. No tool changes them.
 
 Known limits:
 
@@ -163,6 +249,8 @@ Known limits:
 - Local limits are not a billing cap. Set budget caps in the ad platform itself.
 - Use credentials with the least privilege that the work needs.
 - The data an agent reads through these tools goes to whatever model that agent uses.
+- The credential store keeps secrets out of a plain file, out of commits and backups, and away from an agent that can only read files. An agent that may run any shell command as you can ask the operating system for them.
+- A schedule runs only while the machine is on, and a local schedule is not a monitor: a run that did not happen raises no alarm.
 
 ## Jev
 

@@ -24,6 +24,7 @@ const PATHS: Paths = {
   brief: '/nonexistent/apm/brief.md',
   approvalKey: '/nonexistent/apm/approval.key',
   killFile: '/nonexistent/apm/KILL',
+  credentials: '/nonexistent/apm/credentials.json',
 };
 
 function pause(findingIds?: string[]): Action {
@@ -134,6 +135,8 @@ function setup(options: {
     account: (id) => findAccount(config, id),
     connector: notUsed,
     killSwitch: () => false,
+    jobs: undefined as unknown as Runtime['jobs'],
+    credentials: { store: 'none', fromStore: [], unreadable: [] },
   };
   return { runtime, gatePlan, verify };
 }

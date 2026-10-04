@@ -1,6 +1,6 @@
 import { createHash, createSign } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { envFor } from '../core/env';
+import { credentialUnavailable, envFor } from '../core/env';
 import { AutopilotError } from '../core/errors';
 import type { AccountConfig, Env, HttpClient } from '../core/types';
 
@@ -44,16 +44,26 @@ function envValue(env: Env, name: string): string | undefined {
 
 /**
  * The three refresh-flow values, all from one scope so that two identities never mix: when any
- * account-prefixed name (canonical or alias) is set, every value comes from prefixed names;
- * otherwise every value comes from the global names. The canonical name wins over its alias.
+ * account-prefixed name (canonical or alias) is set or is unavailable, every value comes from
+ * prefixed names; otherwise every value comes from the global names. The canonical name wins over
+ * its alias. An unavailable name has no value and blocks its fallbacks: an unavailable canonical
+ * name is not replaced by its alias, and an unavailable prefixed name is not replaced by a global one.
  */
 function resolveRefreshVars(env: Env, account: AccountConfig): { prefix: string; values: (string | undefined)[] } {
   const read = (prefix: string): (string | undefined)[] =>
-    REFRESH_VARS.map(([name, alias]) => envValue(env, prefix + name) ?? envValue(env, prefix + alias));
+    REFRESH_VARS.map(([name, alias]) => {
+      if (credentialUnavailable(env, prefix + name)) return undefined;
+      const canonical = envValue(env, prefix + name);
+      if (canonical !== undefined) return canonical;
+      return credentialUnavailable(env, prefix + alias) ? undefined : envValue(env, prefix + alias);
+    });
   const prefix = account.envPrefix ?? '';
   if (prefix !== '') {
     const values = read(prefix);
-    if (values.some((value) => value !== undefined)) return { prefix, values };
+    const claimed =
+      values.some((value) => value !== undefined) ||
+      REFRESH_VARS.some((names) => names.some((name) => credentialUnavailable(env, prefix + name)));
+    if (claimed) return { prefix, values };
   }
   return { prefix: '', values: read('') };
 }

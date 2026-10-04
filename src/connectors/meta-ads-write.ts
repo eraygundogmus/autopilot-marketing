@@ -210,10 +210,20 @@ async function buildForm(
 export async function applyMetaAdsAction(
   deps: ConnectorDeps,
   action: Action,
-  options: { validateOnly: boolean; idempotencyKey: string },
+  options: { validateOnly: boolean; idempotencyKey: string; beforeWrite?: () => void },
 ): Promise<ActionResult> {
   const { validateOnly } = options;
   let token: string | undefined;
+  // An error thrown by `beforeWrite` leaves this function unchanged: it is never reported as a result.
+  let refusal: { error: unknown } | undefined;
+  const beforeWrite = (): void => {
+    try {
+      options.beforeWrite?.();
+    } catch (error) {
+      refusal = { error };
+      throw error;
+    }
+  };
   try {
     const { entity, operation } = parseKind(action.kind);
     const id = targetId(action);
@@ -230,6 +240,7 @@ export async function applyMetaAdsAction(
     });
     assertOwnedByAccount(deps, entity, asObject(owner.body));
 
+    if (!validateOnly) beforeWrite();
     const response = await deps.http.request({
       url: `${ctx.base}/${id}`,
       method: 'POST',
@@ -254,6 +265,7 @@ export async function applyMetaAdsAction(
     if (typeof traceId === 'string' && traceId !== '') result.platformRequestId = traceId;
     return result;
   } catch (error) {
+    if (refusal !== undefined && refusal.error === error) throw error;
     if (!(error instanceof AutopilotError)) throw error;
     // A retryable failure on a live call may have reached the platform: the executor must reconcile it.
     if (error.retryable && !validateOnly) throw error;

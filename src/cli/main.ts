@@ -11,6 +11,7 @@ import { runStdio } from '../mcp/stdio';
 import { sourcesOverview } from '../ops/data';
 import { VERSION } from '../version';
 import { workCommands } from './commands';
+import { operateCommands } from './operate';
 
 export interface CliIo {
   stdout: (text: string) => void;
@@ -18,6 +19,8 @@ export interface CliIo {
   stdin: { isTTY?: boolean };
   /** Asks a yes/no question on the terminal. */
   confirm: (question: string) => Promise<boolean>;
+  /** Reads a secret: the whole of a piped stdin, or one line typed on the terminal without echo. */
+  readSecret: (prompt: string) => Promise<string>;
 }
 
 type Flags = Record<string, string | boolean | string[] | undefined>;
@@ -36,7 +39,8 @@ const COMMAND_GROUPS: ReadonlyArray<readonly [string, ReadonlyArray<readonly [st
     'Setup',
     [
       ['init [--force]', 'Create the home directory, config.json and brief.md'],
-      ['doctor', 'Check configuration, credentials, kill switch and ledger'],
+      ['doctor [--connect [accountId]]', 'Check configuration, credentials, kill switch and ledger; --connect tests live access'],
+      ['credentials set <NAME> | list | delete <NAME>', "Keep a credential in the operating system's credential store"],
       ['mcp', 'Start the MCP server on stdio for your AI agent'],
     ],
   ],
@@ -64,6 +68,10 @@ const COMMAND_GROUPS: ReadonlyArray<readonly [string, ReadonlyArray<readonly [st
     'Operate',
     [
       ['run <accountId> [--days N]', 'Snapshot, audit, plan and apply within the configured autonomy'],
+      ['schedule list | run [--watch] [--interval seconds]', 'Show the schedules, or run what is due'],
+      ['jobs [--account id] [--limit N]', 'Show recent scheduled runs and what needs attention'],
+      ['reconcile <accountId>', 'Settle changes an interrupted run left with an unknown outcome'],
+      ['agent "<task>" [--model name] [--account id]', 'Run a task with a local model (Ollama) and the same tools'],
       ['kill on|off', 'Turn the kill switch on or off'],
       ['help', 'Show this text'],
       ['version', 'Show the version'],
@@ -87,8 +95,43 @@ const USAGE = [
   'Global options: --json, --help, --version',
 ].join('\n');
 
+/** The whole of a piped stdin without its last newline, or one line typed on the terminal without echo. */
+function readSecret(prompt: string): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const input = process.stdin;
+    if (input.isTTY !== true) {
+      const chunks: Buffer[] = [];
+      input.on('data', (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
+      input.once('end', () => resolve(Buffer.concat(chunks).toString('utf8').replace(/\r?\n$/, '')));
+      input.once('error', reject);
+      return;
+    }
+    process.stderr.write(prompt);
+    input.setRawMode(true);
+    input.resume();
+    let value = '';
+    const done = (finish: () => void): void => {
+      input.setRawMode(false);
+      input.pause();
+      input.off('data', onData);
+      process.stderr.write('\n');
+      finish();
+    };
+    const onData = (chunk: Buffer): void => {
+      for (const char of chunk.toString('utf8')) {
+        if (char === '\r' || char === '\n' || char === '\u0004') return done(() => resolve(value));
+        if (char === '\u0003') return done(() => reject(new AutopilotError('invalid_input', 'Cancelled.')));
+        if (char === '\u007f' || char === '\b') value = value.slice(0, -1);
+        else value += char;
+      }
+    };
+    input.on('data', onData);
+  });
+}
+
 function defaultIo(): CliIo {
   return {
+    readSecret,
     stdout: (text) => {
       process.stdout.write(`${text}\n`);
     },
@@ -163,7 +206,7 @@ function runInit(io: CliIo, flags: Flags, json: boolean): number {
       '',
       'Next steps:',
       `  1. Edit ${paths.config} to add accounts and set autonomy.`,
-      `  2. Put credentials in ${paths.envFile}.`,
+      `  2. Store credentials with \`autopilot-marketing credentials set <NAME>\`, or put them in ${paths.envFile}.`,
       '  3. Run `autopilot-marketing doctor`.',
     ],
   );
@@ -193,6 +236,9 @@ function runDoctor(runtime: Runtime, io: CliIo, json: boolean): number {
     `Judgment:    ${overview.judgment.mode} (${overview.judgment.model})`,
     `Kill switch: ${overview.killSwitch ? 'ON (no live change will be applied)' : 'off'}`,
     `Ledger:      ${ledgerOk ? `ok, ${overview.ledger.entries} entries` : `BROKEN at entry ${overview.ledger.brokenAt}`}`,
+    `Credentials: ${runtime.credentials.fromStore.length} from the credential store (${runtime.credentials.store})`,
+    ...runtime.credentials.unreadable.map((entry) => `  NOT READABLE ${entry.name}: ${redact(entry.reason)}`),
+    `Schedules:   ${(runtime.config.schedules ?? []).length} configured`,
     '',
     `Accounts (${accounts.length}):`,
     ...accounts.map((account) => {
@@ -216,6 +262,8 @@ function runDoctor(runtime: Runtime, io: CliIo, json: boolean): number {
       killSwitch: overview.killSwitch,
       accounts,
       ledger: overview.ledger,
+      credentials: runtime.credentials,
+      schedules: (runtime.config.schedules ?? []).length,
     },
     lines,
   );
@@ -310,7 +358,16 @@ export async function main(argv: string[], io?: Partial<CliIo>): Promise<number>
         receipt: { type: 'string' },
         verify: { type: 'boolean' },
         limit: { type: 'string' },
-        account: { type: 'string' },
+        account: { type: 'string', multiple: true },
+        watch: { type: 'boolean' },
+        interval: { type: 'string' },
+        connect: { type: 'boolean' },
+        model: { type: 'string' },
+        'base-url': { type: 'string' },
+        'max-steps': { type: 'string' },
+        'allow-remote': { type: 'boolean' },
+        'allow-apply': { type: 'boolean' },
+        jev: { type: 'boolean' },
         force: { type: 'boolean' },
         csv: { type: 'string', multiple: true },
         'no-judgments': { type: 'boolean' },
@@ -320,6 +377,8 @@ export async function main(argv: string[], io?: Partial<CliIo>): Promise<number>
       },
     });
     const flags = normalizeFlags(parsed.values);
+    // --account may repeat (the local runner's scope); one value stays a plain string.
+    if (Array.isArray(flags.account) && flags.account.length === 1) flags.account = flags.account[0];
     json = flags.json === true;
     const [command, ...args] = parsed.positionals;
 
@@ -345,12 +404,21 @@ export async function main(argv: string[], io?: Partial<CliIo>): Promise<number>
           reportError(cli, error, json);
           return error instanceof AutopilotError && error.code === 'invalid_input' ? EXIT_USAGE : EXIT_FAILURE;
         }
-      case 'doctor':
+      case 'doctor': {
+        const connect = operateCommands.connect;
+        if (flags.connect === true && connect !== undefined) {
+          return await connect({ runtime: createRuntime(), io: cli, args, flags, json });
+        }
         return runDoctor(createRuntime(), cli, json);
+      }
       case 'ledger':
         return runLedger(createRuntime(), cli, flags, json);
       default: {
-        const handler = Object.hasOwn(workCommands, command) ? workCommands[command] : undefined;
+        const handler = Object.hasOwn(workCommands, command)
+          ? workCommands[command]
+          : Object.hasOwn(operateCommands, command) && command !== 'connect'
+            ? operateCommands[command]
+            : undefined;
         if (!handler) {
           if (json) {
             reportError(cli, usageError(`Unknown command: ${command}`, 'Run `autopilot-marketing help`.'), true);

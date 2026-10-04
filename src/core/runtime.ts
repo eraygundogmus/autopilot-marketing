@@ -1,16 +1,19 @@
 import { createHttpClient } from '../connectors/http';
 import { createConnector } from '../connectors/registry';
+import { createJobQueue } from '../jobs/queue';
 import { createJudge } from '../judgment/judge';
 import { createTypeSafeClient } from '../judgment/typesafe';
 import { createApprovalService } from '../plan/approval';
 import { createLedger } from '../plan/ledger';
 import { effectiveAutonomy, findAccount, killSwitchOn, loadConfig } from './config';
 import { openDatabase } from './db';
+import { AutopilotError } from './errors';
 import type { Db } from './db';
 import { loadEnv } from './env';
 import { ensureHome, resolvePaths } from './paths';
+import { loadStoredCredentials } from './secrets';
 import { createStore } from './store';
-import type { AccountConfig, Answer, Connector, Env, Runtime } from './types';
+import type { AccountConfig, Answer, Connector, Env, JobQueue, Runtime } from './types';
 
 export interface RuntimeOptions {
   env?: Env;
@@ -43,7 +46,17 @@ export function createRuntime(options: RuntimeOptions = {}): Runtime {
   const base = options.env ?? process.env;
   const paths = resolvePaths(base);
   ensureHome(paths);
-  const env = loadEnv(paths, base);
+  // Reads the operating system's credential store only for names the person registered there.
+  const stored = loadStoredCredentials(paths);
+  // Without a readable index nobody knows which names belong to the credential store, so a stale
+  // value from .env could silently stand in for one of them. Stop instead.
+  const brokenIndex = stored.sources.unreadable.find((entry) => entry.name === 'credentials.json');
+  if (brokenIndex !== undefined) {
+    throw new AutopilotError('config_invalid', `Cannot read ${paths.credentials}: ${brokenIndex.reason}`, {
+      hint: 'Fix the file, or delete it and register the credentials again with `autopilot-marketing credentials set <NAME>`.',
+    });
+  }
+  const env = loadEnv(paths, base, { values: stored.values, blocked: stored.blocked });
   const config = loadConfig(paths);
   const now = options.now ?? (() => new Date());
 
@@ -58,6 +71,7 @@ export function createRuntime(options: RuntimeOptions = {}): Runtime {
   const http = createHttpClient({ env, ...fetchOption });
 
   const connectors = new Map<string, Connector>();
+  let jobs: JobQueue | undefined;
 
   return {
     config,
@@ -80,5 +94,10 @@ export function createRuntime(options: RuntimeOptions = {}): Runtime {
     },
     // Evaluated on every call: a KILL file created while the process runs must take effect.
     killSwitch: () => killSwitchOn(config, paths, env),
+    get jobs(): JobQueue {
+      jobs ??= createJobQueue(db);
+      return jobs;
+    },
+    credentials: stored.sources,
   };
 }

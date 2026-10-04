@@ -29,6 +29,9 @@ Tool names are given bare here. Each client adds its own prefix.
 - `judge_terms` classifies search terms and drafts negative keywords. `judge_copy` rates ad copy variants. `judge_claims` marks each statement verified, contradicted or unsupported against the data.
 - `plan_create` stores a plan of typed actions and changes nothing. `plan_preview` returns the exact review text. `plan_apply` is a dry run by default. `plan_revert` creates a new compensating plan for an applied plan.
 - `ledger_list` returns the append-only change log and its integrity.
+- `jobs_list` returns the owner's schedules and the recent scheduled runs with their results and the reasons a person should look. Schedules are set by the owner in the config file: no tool creates, changes or starts one.
+
+When a tool says rows are kept on this machine, the owner turned row-level data off for that account. Work from the findings and the report; do not try to get the rows another way.
 
 A plan can only contain these action kinds. There is no delete and no raw API call.
 

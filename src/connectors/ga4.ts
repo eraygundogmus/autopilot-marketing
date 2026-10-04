@@ -11,6 +11,7 @@ import type {
   SnapshotRequest,
 } from '../core/types';
 import { GA4_SCOPE, getGoogleAccessToken, googleAuthMissing } from './google-auth';
+import { diagnoseGa4 } from './other-diagnose';
 import { buildSnapshot } from './snapshot';
 
 const DIMENSIONS = {
@@ -93,6 +94,8 @@ export function createGa4Connector(deps: ConnectorDeps): Connector {
         actions: [],
       };
     },
+
+    diagnose: () => diagnoseGa4(deps),
 
     async fetchSnapshot(request: SnapshotRequest) {
       assertRange(request.dateRange);

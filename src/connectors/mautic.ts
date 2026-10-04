@@ -2,6 +2,7 @@ import { ACTION_KINDS } from '../core/types';
 import type { Connector, ConnectorDeps } from '../core/types';
 import { fetchMauticSnapshot, mauticAuthMissing } from './mautic-read';
 import { applyMauticAction, readMauticState } from './mautic-write';
+import { diagnoseMautic } from './other-diagnose';
 
 export function createMauticConnector(deps: ConnectorDeps): Connector {
   return {
@@ -25,5 +26,6 @@ export function createMauticConnector(deps: ConnectorDeps): Connector {
     fetchSnapshot: (request) => fetchMauticSnapshot(deps, request),
     readState: (draft) => readMauticState(deps, draft),
     apply: (action, options) => applyMauticAction(deps, action, options),
+    diagnose: () => diagnoseMautic(deps),
   };
 }

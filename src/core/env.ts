@@ -21,11 +21,22 @@ function parseEnvFile(text: string): Env {
   return parsed;
 }
 
+/** Names registered for the credential store that could not be read, per environment object. */
+const unavailable = new WeakMap<Env, Set<string>>();
+
+/** True when `name` is kept in the credential store but could not be read from it. */
+export function credentialUnavailable(env: Env, name: string): boolean {
+  return unavailable.get(env)?.has(name) ?? false;
+}
+
 /**
- * Process environment overlaid on `<home>/.env` (the process wins). Accepts `NAME=value`,
- * `export NAME=value`, quotes and `#` comments.
+ * `<home>/.env`, overlaid by the credential store, overlaid by the process environment. Accepts
+ * `NAME=value`, `export NAME=value`, quotes and `#` comments.
+ *
+ * A name in `stored.blocked` is registered for the credential store but could not be read: it gets
+ * no value from `.env` (which may be stale or belong to another identity), only from the process.
  */
-export function loadEnv(paths: Paths, base: Env = process.env): Env {
+export function loadEnv(paths: Paths, base: Env = process.env, stored: { values: Env; blocked: string[] } = { values: {}, blocked: [] }): Env {
   let fromFile: Env = {};
   let text: string | undefined;
   try {
@@ -41,9 +52,19 @@ export function loadEnv(paths: Paths, base: Env = process.env): Env {
   }
   if (text !== undefined) fromFile = parseEnvFile(text);
   const merged: Env = { ...fromFile };
+  for (const name of stored.blocked) delete merged[name];
+  for (const [name, value] of Object.entries(stored.values)) {
+    if (value !== undefined) merged[name] = value;
+  }
+  const blocked = new Set<string>();
+  for (const name of stored.blocked) {
+    const override = base[name];
+    if (override === undefined || override === '') blocked.add(name);
+  }
   for (const [name, value] of Object.entries(base)) {
     if (value !== undefined) merged[name] = value;
   }
+  if (blocked.size > 0) unavailable.set(merged, blocked);
   return merged;
 }
 
@@ -52,7 +73,10 @@ export function envFor(env: Env, account: AccountConfig, name: string): string |
   if (account.envPrefix !== undefined && account.envPrefix !== '') {
     const prefixed = env[account.envPrefix + name];
     if (typeof prefixed === 'string' && prefixed !== '') return prefixed;
+    // The account's own credential exists but cannot be read: do not fall back to the shared one.
+    if (credentialUnavailable(env, account.envPrefix + name)) return undefined;
   }
+  if (credentialUnavailable(env, name)) return undefined;
   const plain = env[name];
   return typeof plain === 'string' && plain !== '' ? plain : undefined;
 }

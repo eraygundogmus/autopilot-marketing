@@ -113,8 +113,10 @@ describe('an agent cannot change a live account on its own', () => {
   it('offers no tool that approves a plan or changes the policy', async () => {
     const { mcp } = await setup();
     const names = (await mcp.tools()).map((tool) => tool.name);
-    expect(names).toHaveLength(14);
-    expect(names.filter((name) => /approv|receipt|policy|config|autonomy/i.test(name))).toEqual([]);
+    expect(names).toHaveLength(15);
+    // No tool approves, edits the owner's config, or creates, changes or starts a schedule.
+    expect(names.filter((name) => /approv|receipt|policy|config|autonomy|schedule|credential/i.test(name))).toEqual([]);
+    expect(names.filter((name) => name.startsWith('jobs_'))).toEqual(['jobs_list']);
   });
 
   it('rejects an action kind outside the allowlist', async () => {

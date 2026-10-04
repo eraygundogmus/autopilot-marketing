@@ -226,7 +226,10 @@ export function createDemoConnector(deps: ConnectorDeps): Connector {
     return state;
   };
 
-  const apply = async (action: Action, options: { validateOnly: boolean }): Promise<ActionResult> => {
+  const apply = async (
+    action: Action,
+    options: { validateOnly: boolean; beforeWrite?: () => void },
+  ): Promise<ActionResult> => {
     if (options.validateOnly) return { ok: true, dryRun: true, after: null };
     const paths = resolvePaths(deps.env);
     ensureHome(paths);
@@ -257,6 +260,7 @@ export function createDemoConnector(deps: ConnectorDeps): Connector {
       overlay.entities[key] = entity;
     }
     state[account.id] = overlay;
+    options.beforeWrite?.();
     writeStateFile(file, state);
     return { ok: true, dryRun: false, simulated: true, after: null, resource: action.target.id };
   };

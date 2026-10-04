@@ -16,6 +16,7 @@ const DEFAULT_MAX_ATTEMPTS = 4;
 const MAX_RETRY_AFTER_MS = 30_000;
 const MAX_BACKOFF_MS = 8_000;
 const ERROR_BODY_CHARS = 300;
+const ERROR_DETAIL_CHARS = 4000;
 
 interface Attempt {
   response?: HttpResponse<unknown>;
@@ -78,12 +79,15 @@ export function createHttpClient(options: HttpOptions = {}): HttpClient {
 
       if (res.status < 200 || res.status >= 300) {
         // Redaction sees the whole body: a secret cut by truncation would no longer be recognised.
-        const message = `${where} -> ${res.status}: ${clean(text).slice(0, ERROR_BODY_CHARS)}`;
+        const cleaned = clean(text);
+        const message = `${where} -> ${res.status}: ${cleaned.slice(0, ERROR_BODY_CHARS)}`;
         const wait = retryAfterMs(resHeaders['retry-after']);
+        // The message stays short; the longer body is for code that classifies the failure.
+        const details = { status: res.status, body: cleaned.slice(0, ERROR_DETAIL_CHARS) };
         const error =
           res.status === 429
-            ? new AutopilotError('rate_limited', message, { retryable: true })
-            : new AutopilotError('platform_error', message, { retryable: res.status >= 500 });
+            ? new AutopilotError('rate_limited', message, { retryable: true, ...details })
+            : new AutopilotError('platform_error', message, { retryable: res.status >= 500, ...details });
         return wait === undefined ? { error } : { error, retryAfterMs: wait };
       }
 

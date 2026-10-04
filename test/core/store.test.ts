@@ -16,6 +16,7 @@ function pathsFor(db: string): Paths {
     brief: '/nonexistent/apm/brief.md',
     approvalKey: '/nonexistent/apm/approval.key',
     killFile: '/nonexistent/apm/KILL',
+    credentials: '/nonexistent/apm/credentials.json',
   };
 }
 

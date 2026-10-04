@@ -11,7 +11,7 @@ import type {
 } from '../../src/core/types';
 import { buildAction, planDigest } from '../../src/plan/actions';
 import { createApprovalService } from '../../src/plan/approval';
-import { applyPlan, createRevertPlan } from '../../src/plan/executor';
+import { applyPlan, createRevertPlan, reconcileAccount } from '../../src/plan/executor';
 import type { ApplyOptions } from '../../src/plan/executor';
 import { createLedger } from '../../src/plan/ledger';
 
@@ -64,6 +64,7 @@ function fixture(actions: Action[] = [action('one')]) {
     home: '/executor-test', config: '/executor-test/config.json', envFile: '/executor-test/.env',
     db: ':memory:', brief: '/executor-test/brief.md', approvalKey: '/executor-test/approval.key',
     killFile: '/executor-test/KILL',
+    credentials: '/executor-test/credentials.json',
   };
   const db = openDatabase(paths);
   databases.push(db);
@@ -94,7 +95,10 @@ function fixture(actions: Action[] = [action('one')]) {
     calls.push({ method: 'apply', id: item.target.id, events: ledger.read().map((entry) => entry.event) });
     const step = applySteps.shift();
     if (step !== undefined) return step(item, options);
-    if (!options.validateOnly) states.set(stateKey(item), { ...states.get(stateKey(item)), ...item.after });
+    if (!options.validateOnly) {
+      options.beforeWrite?.();
+      states.set(stateKey(item), { ...states.get(stateKey(item)), ...item.after });
+    }
     return { ok: true, dryRun: options.validateOnly, after: null };
   });
   // Current entity metadata and rows the platform would report besides the entities under test.
@@ -163,6 +167,8 @@ function fixture(actions: Action[] = [action('one')]) {
     },
     connector: () => connector,
     killSwitch: () => control.killed,
+    jobs: undefined as unknown as Runtime['jobs'],
+    credentials: { store: 'none', fromStore: [], unreadable: [] },
   };
   const plan: Plan = {
     id: shortId('plan', actions), schemaVersion: 1, createdAt: START.toISOString(), createdBy: 'agent',
@@ -367,6 +373,7 @@ describe('applyPlan execution', () => {
     expect(entries[1]?.idempotencyKey).toBe(`${outcome.executionId}:${f.plan.actions[0]!.id}`);
     expect(f.apply.mock.calls[0]?.[1]).toEqual({
       validateOnly: false, idempotencyKey: `${outcome.executionId}:${f.plan.actions[0]!.id}`,
+      beforeWrite: expect.any(Function),
     });
     expect(entries[2]?.data).toMatchObject({ resource: 'ads/one', platformRequestId: 'request-1' });
     expect(entries[5]?.data).toEqual({ applied: 2, failed: 0, skipped: 0, unknown: 0, status: 'applied' });
@@ -567,6 +574,192 @@ describe('applyPlan execution', () => {
     expect(f.apply).not.toHaveBeenCalled();
     expect(f.ledger.read({ events: ['action.intent'] })).toHaveLength(1);
     expect(f.ledger.read({ events: ['action.skipped'] })).toHaveLength(2);
+  });
+
+  it.each(['precondition read', 'intent append'] as const)
+  ('does not dispatch after another execution takes the lock during the %s', async (stage) => {
+    const f = fixture([action('one'), action('two')]);
+    f.approve();
+    const holder = shortId('exec', 'new-holder');
+    const takeExpiredLock = () => {
+      f.control.now = new Date(START.getTime() + 16 * 60 * 1000);
+      expect(f.store.acquireLock(f.account.id, holder, f.runtime.now(), 900)).toBe(true);
+    };
+    if (stage === 'precondition read') {
+      f.readSteps.push(() => {
+        takeExpiredLock();
+        return { status: 'ENABLED' };
+      });
+    } else {
+      const append = f.ledger.append.bind(f.ledger);
+      vi.spyOn(f.ledger, 'append').mockImplementation((entry) => {
+        const written = append(entry);
+        if (entry.event === 'action.intent') takeExpiredLock();
+        return written;
+      });
+    }
+    const outcome = await applyPlan(f.plan.id, f.runtime, LIVE);
+    expect(outcome).toMatchObject({ applied: 0, failed: 0, skipped: 2, unknown: 0, plan: { status: 'failed' } });
+    expect(outcome.results.every((result) => /lock.*lost|lost.*lock/i.test(result.note ?? ''))).toBe(true);
+    expect(f.apply).not.toHaveBeenCalled();
+    expect(f.readState).toHaveBeenCalledTimes(1);
+    const entries = f.ledger.read();
+    expect(entries.filter((entry) => entry.event === 'action.skipped')).toHaveLength(2);
+    expect(entries.filter((entry) => entry.event === 'action.intent')).toHaveLength(stage === 'precondition read' ? 0 : 1);
+    const unresolved = entries.filter((entry) => entry.event === 'action.intent' && !entries.some((later) =>
+      later.seq > entry.seq && later.executionId === entry.executionId && later.actionId === entry.actionId
+        && (later.event === 'action.skipped' || later.event === 'action.failed')));
+    expect(unresolved).toEqual([]);
+    expect(f.store.acquireLock(f.account.id, shortId('exec', 'contender'), f.runtime.now(), 900)).toBe(false);
+    f.store.releaseLock(f.account.id, holder);
+    assertLockReleased(f);
+  });
+
+  it.each([900_000, 960_000])
+  ('stops after its lock expires at %i ms during the precondition read even without a new owner', async (elapsed) => {
+    const f = fixture([action('one'), action('two')]);
+    f.approve();
+    f.readSteps.push(() => {
+      f.control.now = new Date(START.getTime() + elapsed);
+      return { status: 'ENABLED' };
+    });
+    const outcome = await applyPlan(f.plan.id, f.runtime, LIVE);
+    expect(outcome).toMatchObject({ applied: 0, skipped: 2, failed: 0, unknown: 0 });
+    expect(outcome.results.every((result) => /lock.*lost|lost.*lock/i.test(result.note ?? ''))).toBe(true);
+    expect(f.apply).not.toHaveBeenCalled();
+    const entries = f.ledger.read();
+    expect(entries.filter((entry) => entry.event === 'action.skipped')).toHaveLength(2);
+    expect(entries.filter((entry) => entry.event === 'action.intent').every((intent) => entries.some((entry) =>
+      entry.seq > intent.seq && entry.executionId === intent.executionId && entry.actionId === intent.actionId
+        && entry.event === 'action.skipped'))).toBe(true);
+    assertLockReleased(f);
+  });
+
+  it('skips an intended write when another execution takes the lock during a connector read', async () => {
+    const f = fixture([action('one'), action('two')]);
+    f.approve();
+    const holder = shortId('exec', 'connector-read-holder');
+    const write = vi.fn();
+    let resume!: () => void;
+    let entered!: () => void;
+    const read = new Promise<void>((resolve) => { resume = resolve; });
+    const reading = new Promise<void>((resolve) => { entered = resolve; });
+    f.applySteps.push(async (item, options) => {
+      entered();
+      await read;
+      options.beforeWrite?.();
+      write();
+      f.states.set(stateKey(item), item.after);
+      return { ok: true, dryRun: false, after: null };
+    });
+    const applying = applyPlan(f.plan.id, f.runtime, LIVE);
+    await reading;
+    try {
+      f.control.now = new Date(START.getTime() + 16 * 60 * 1000);
+      expect(f.store.acquireLock(f.account.id, holder, f.runtime.now(), 900)).toBe(true);
+    } finally {
+      resume();
+    }
+    const outcome = await applying;
+    expect(write).not.toHaveBeenCalled();
+    expect(f.apply).toHaveBeenCalledTimes(1);
+    expect(f.readState).toHaveBeenCalledTimes(1);
+    expect(outcome).toMatchObject({ applied: 0, failed: 0, skipped: 2, unknown: 0, plan: { status: 'failed' } });
+    expect(outcome.results.map((result) => result.status)).toEqual(['skipped', 'skipped']);
+    expect(outcome.results.map((result) => result.note)).toEqual([
+      'the execution lock was lost', 'the execution lock was lost',
+    ]);
+    expect(f.states.get('ad:one')).toEqual({ status: 'ENABLED' });
+    const entries = actionEntries(f);
+    expect(entries.map((entry) => entry.event)).toEqual(['action.intent', 'action.skipped', 'action.skipped']);
+    expect(entries[1]).toMatchObject({
+      actionId: entries[0]!.actionId, executionId: entries[0]!.executionId,
+      data: { reason: 'the execution lock was lost' },
+    });
+    expect(entries[1]!.seq).toBeGreaterThan(entries[0]!.seq);
+    expect(entries[2]).toMatchObject({ actionId: f.plan.actions[1]!.id, data: { reason: outcome.results[0]!.note } });
+    expect(f.ledger.read({ events: ['action.unknown'] })).toEqual([]);
+    expect(f.store.getPlan(f.plan.id)).toEqual(outcome.plan);
+    expect(f.ledger.verify().ok).toBe(true);
+    expect(f.store.acquireLock(f.account.id, shortId('exec', 'contender'), f.runtime.now(), 900)).toBe(false);
+    f.store.releaseLock(f.account.id, holder);
+    assertLockReleased(f);
+  });
+
+  it.each(['initial check', 'connector read'] as const)
+  ('skips every action with the caller guard reason when the job is lost during the %s', async (stage) => {
+    const f = fixture([action('one'), action('two')]);
+    f.approve();
+    let lost = stage === 'initial check';
+    const guard = vi.fn(() => {
+      if (lost) throw new Error('Scheduled job was taken over by another worker.');
+    });
+    const write = vi.fn();
+    f.applySteps.push(async (item, options) => {
+      await Promise.resolve();
+      lost = true;
+      options.beforeWrite?.();
+      write();
+      f.states.set(stateKey(item), item.after);
+      return { ok: true, dryRun: false, after: null };
+    });
+    const outcome = await applyPlan(f.plan.id, f.runtime, { ...LIVE, guard });
+    const reason = 'the job claim was lost: Scheduled job was taken over by another worker.';
+    expect(guard).toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+    expect(f.apply).toHaveBeenCalledTimes(stage === 'initial check' ? 0 : 1);
+    expect(f.readState).toHaveBeenCalledTimes(stage === 'initial check' ? 0 : 1);
+    expect(outcome).toMatchObject({ applied: 0, failed: 0, skipped: 2, unknown: 0, plan: { status: 'failed' } });
+    expect(outcome.results.map((result) => result.note)).toEqual([reason, reason]);
+    expect(outcome.results.every((result) => result.status === 'skipped' && result.result === null)).toBe(true);
+    expect(actionEntries(f).map((entry) => entry.event)).toEqual([
+      ...(stage === 'initial check' ? [] : ['action.intent']), 'action.skipped', 'action.skipped',
+    ]);
+    expect(f.ledger.read({ events: ['action.skipped'] }).map((entry) => entry.data?.reason)).toEqual([reason, reason]);
+    expect(f.store.getPlan(f.plan.id)).toEqual(outcome.plan);
+    assertLockReleased(f);
+  });
+
+  it('calls the passing caller guard immediately before every live write', async () => {
+    const f = fixture([action('one'), action('two')]);
+    f.approve();
+    const guard = vi.fn();
+    const write = vi.fn((item: Action) => { f.states.set(stateKey(item), item.after); });
+    for (const _action of f.plan.actions) {
+      f.applySteps.push((item, options) => {
+        const callsBeforeWrite = guard.mock.calls.length;
+        expect(options.beforeWrite).toBeTypeOf('function');
+        options.beforeWrite!();
+        expect(guard).toHaveBeenCalledTimes(callsBeforeWrite + 1);
+        write(item);
+        return { ok: true, dryRun: false, after: null };
+      });
+    }
+    const outcome = await applyPlan(f.plan.id, f.runtime, { ...LIVE, guard });
+    expect(outcome).toMatchObject({ applied: 2, failed: 0, skipped: 0, unknown: 0, plan: { status: 'applied' } });
+    expect(write).toHaveBeenCalledTimes(2);
+    expect(guard.mock.calls.length).toBeGreaterThanOrEqual(write.mock.calls.length);
+    expect(f.states.get('ad:one')).toEqual({ status: 'PAUSED' });
+    expect(f.states.get('ad:two')).toEqual({ status: 'PAUSED' });
+    assertLockReleased(f);
+  });
+
+  it.each(['failed', 'unknown'] as const)
+  ('keeps a connector stale_state error %s when the write guard did not throw', async (status) => {
+    const f = fixture([action('one'), action('two')]);
+    f.approve();
+    f.applySteps.push((item, options) => {
+      options.beforeWrite?.();
+      if (status === 'unknown') f.states.set(stateKey(item), { status: 'REMOVED' });
+      throw new AutopilotError('stale_state', 'the execution lock was lost');
+    });
+    const outcome = await applyPlan(f.plan.id, f.runtime, LIVE);
+    expect(outcome.results.map((result) => result.status)).toEqual([status, 'skipped']);
+    expect(outcome.results[0]?.result?.error).toMatchObject({ code: 'stale_state', message: 'the execution lock was lost' });
+    expect(f.readState).toHaveBeenCalledTimes(2);
+    expect(f.apply).toHaveBeenCalledTimes(1);
+    expect(actionEntries(f).map((entry) => entry.event)).toEqual(['action.intent', `action.${status}`, 'action.skipped']);
+    assertLockReleased(f);
   });
 
   it('never resends a successful mutation when recording its result fails', async () => {
@@ -883,7 +1076,174 @@ describe('reconciliation before execution', () => {
   });
 });
 
+describe('reconcileAccount', () => {
+  it.each(['applied', 'not_applied', 'conflict'] as const)
+  ('returns and repairs an unresolved intent with outcome %s without sending a mutation', async (outcome) => {
+    const f = fixture();
+    const prior = action('earlier', {
+      status: 'unknown',
+      before: { status: 'ENABLED', metadata: 'old' },
+      result: {
+        ok: false, dryRun: false, after: null,
+        error: { code: 'timeout', message: 'Timed out.', retryable: true },
+      },
+    });
+    const intent = f.oldIntent(prior);
+    const original: Plan = { ...f.plan, id: intent.planId!, actions: [prior], status: 'applying' };
+    original.digest = planDigest(original);
+    f.store.savePlan(original);
+    const observed = { status: outcome === 'applied' ? 'PAUSED' : outcome === 'not_applied' ? 'ENABLED' : 'REMOVED', metadata: 'new' };
+    f.states.set('ad:earlier', observed);
+
+    expect(await reconcileAccount(f.runtime, f.account.id, ACTOR)).toEqual({
+      reconciled: outcome === 'conflict' ? 0 : 1,
+      applied: outcome === 'applied' ? 1 : 0,
+      notApplied: outcome === 'not_applied' ? 1 : 0,
+      conflicts: outcome === 'conflict' ? ['ad earlier'] : [],
+      repairedPlans: [original.id],
+    });
+    expect(f.ledger.read({ events: ['action.reconciled'] })).toEqual([expect.objectContaining({
+      actor: ACTOR, accountId: f.account.id, planId: original.id, executionId: intent.executionId,
+      actionId: prior.id, idempotencyKey: intent.idempotencyKey, data: expect.objectContaining({ outcome }),
+    })]);
+    expect(f.store.getPlan(original.id)).toMatchObject({
+      status: outcome === 'applied' ? 'applied' : 'failed',
+      actions: [{
+        status: outcome === 'applied' ? 'applied' : outcome === 'not_applied' ? 'failed' : 'unknown',
+        result: { ok: outcome === 'applied', dryRun: false, after: outcome === 'applied' ? observed : null },
+      }],
+    });
+    if (outcome === 'applied') expect(f.store.getPlan(original.id).actions[0]?.result?.error).toBeUndefined();
+    expect(f.store.getPlan(f.plan.id)).toEqual(f.plan);
+    expect(f.readState).toHaveBeenCalledTimes(1);
+    expect(f.apply).not.toHaveBeenCalled();
+    expect(f.ledger.verify().ok).toBe(true);
+    assertLockReleased(f);
+  });
+
+  it.each([
+    { event: 'action.applied', outcome: null, status: 'applied', planStatus: 'applied' },
+    { event: 'action.failed', outcome: null, status: 'failed', planStatus: 'failed' },
+    { event: 'action.skipped', outcome: null, status: 'skipped', planStatus: 'failed' },
+    { event: 'action.reconciled', outcome: 'applied', status: 'applied', planStatus: 'applied' },
+    { event: 'action.reconciled', outcome: 'not_applied', status: 'failed', planStatus: 'failed' },
+  ] as const)('repairs a pending action from its newest $event/$outcome entry and finalizes the plan', async ({ event, outcome, status, planStatus }) => {
+    const f = fixture();
+    f.plan.status = 'applying';
+    f.store.savePlan(f.plan);
+    const item = f.plan.actions[0]!;
+    const base = { actor: ACTOR, accountId: f.account.id, planId: f.plan.id, actionId: item.id, executionId: shortId('exec', 'crashed') };
+    f.ledger.append({ ...base, event: 'action.applied', data: { after: item.after } });
+    f.ledger.append({
+      ...base, event, data: { after: item.after, ...(outcome === null ? {} : { outcome }) },
+    });
+    // A conflict is not a resolving entry and cannot override a recorded result.
+    f.ledger.append({ ...base, event: 'action.reconciled', data: { outcome: 'conflict' } });
+    const before = f.ledger.read();
+
+    expect(await reconcileAccount(f.runtime, f.account.id, ACTOR)).toEqual({
+      reconciled: 0, applied: 0, notApplied: 0, conflicts: [], repairedPlans: [f.plan.id],
+    });
+    expect(f.store.getPlan(f.plan.id)).toMatchObject({ status: planStatus, actions: [{ status }] });
+    expect(f.ledger.read()).toEqual(before);
+    expect(f.readState).not.toHaveBeenCalled();
+    expect(f.apply).not.toHaveBeenCalled();
+    expect(await reconcileAccount(f.runtime, f.account.id, ACTOR)).toEqual({
+      reconciled: 0, applied: 0, notApplied: 0, conflicts: [], repairedPlans: [],
+    });
+    assertLockReleased(f);
+  });
+
+  it('repairs resolved actions while keeping a plan with pending actions open', async () => {
+    const f = fixture([action('one'), action('two')]);
+    f.plan.status = 'applying';
+    f.store.savePlan(f.plan);
+    f.ledger.append({
+      event: 'action.applied', actor: ACTOR, accountId: f.account.id, planId: f.plan.id,
+      actionId: f.plan.actions[0]!.id, data: { after: f.plan.actions[0]!.after },
+    });
+    expect(await reconcileAccount(f.runtime, f.account.id, ACTOR)).toEqual({
+      reconciled: 0, applied: 0, notApplied: 0, conflicts: [], repairedPlans: [f.plan.id],
+    });
+    expect(f.store.getPlan(f.plan.id)).toMatchObject({
+      status: 'applying', actions: [{ status: 'applied' }, { status: 'pending' }],
+    });
+    expect(f.apply).not.toHaveBeenCalled();
+    assertLockReleased(f);
+  });
+
+  it.each(['no ledger', 'plan entry only', 'already finalized'] as const)
+  ('does nothing when there is nothing to reconcile: %s', async (mode) => {
+    const f = fixture();
+    if (mode === 'plan entry only') {
+      f.ledger.append({ event: 'plan.created', actor: ACTOR, accountId: f.account.id, planId: f.plan.id });
+    } else if (mode === 'already finalized') {
+      f.plan.status = 'applied';
+      f.plan.actions[0]!.status = 'applied';
+      f.store.savePlan(f.plan);
+      f.ledger.append({
+        event: 'action.applied', actor: ACTOR, accountId: f.account.id, planId: f.plan.id,
+        actionId: f.plan.actions[0]!.id, data: { after: f.plan.actions[0]!.after },
+      });
+    }
+    const before = f.ledger.read();
+    const append = vi.spyOn(f.ledger, 'append');
+    const save = vi.spyOn(f.store, 'savePlan');
+    expect(await reconcileAccount(f.runtime, f.account.id, ACTOR)).toEqual({
+      reconciled: 0, applied: 0, notApplied: 0, conflicts: [], repairedPlans: [],
+    });
+    expect(append).not.toHaveBeenCalled();
+    expect(save).not.toHaveBeenCalled();
+    expect(f.ledger.read()).toEqual(before);
+    expect(f.store.getPlan(f.plan.id)).toEqual(f.plan);
+    expect(f.readState).not.toHaveBeenCalled();
+    expect(f.apply).not.toHaveBeenCalled();
+    assertLockReleased(f);
+  });
+
+  it('refuses a held account lock with a retryable stale_state error and preserves its owner', async () => {
+    const f = fixture();
+    const holder = shortId('exec', 'holder');
+    expect(f.store.acquireLock(f.account.id, holder, f.runtime.now(), 900)).toBe(true);
+    await expect(reconcileAccount(f.runtime, f.account.id, ACTOR)).rejects.toMatchObject({
+      code: 'stale_state', retryable: true,
+    });
+    expect(f.ledger.read()).toEqual([]);
+    expect(f.readState).not.toHaveBeenCalled();
+    expect(f.apply).not.toHaveBeenCalled();
+    expect(f.store.acquireLock(f.account.id, shortId('exec', 'contender'), f.runtime.now(), 900)).toBe(false);
+    f.store.releaseLock(f.account.id, holder);
+    assertLockReleased(f);
+  });
+
+  it('releases the lock when recording a reconciliation fails', async () => {
+    const f = fixture();
+    f.oldIntent(action('earlier'));
+    f.states.set('ad:earlier', { status: 'PAUSED' });
+    vi.spyOn(f.ledger, 'append').mockImplementation(() => { throw new Error('Reconciliation ledger unavailable.'); });
+    await expect(reconcileAccount(f.runtime, f.account.id, ACTOR)).rejects.toThrow('Reconciliation ledger unavailable.');
+    expect(f.apply).not.toHaveBeenCalled();
+    assertLockReleased(f);
+  });
+});
+
 describe('policy auto-apply', () => {
+  it('requires a human receipt and never asks the remote gate when account judgments are disabled', async () => {
+    const f = fixture();
+    f.account.sharing = { judgments: false };
+    f.runtime.autonomy = 'autopilot';
+    f.runtime.config.policy.autoApply = ['google_ads.ad.pause'];
+    await expect(applyPlan(f.plan.id, f.runtime, LIVE)).rejects.toMatchObject({ code: 'approval_required' });
+    expect(f.gatePlan).not.toHaveBeenCalled();
+    expect(f.apply).not.toHaveBeenCalled();
+    expect(f.store.findReceipts(f.plan.id)).toEqual([]);
+    const receipt = f.approve();
+    expect((await applyPlan(f.plan.id, f.runtime, { ...LIVE, receiptId: receipt.id })).applied).toBe(1);
+    expect(f.gatePlan).not.toHaveBeenCalled();
+    expect(f.store.findReceipts(f.plan.id)).toEqual([receipt]);
+    expect(f.ledger.read({ events: ['execution.claimed'] })[0]?.data?.method).toBe('tty');
+  });
+
   it('requires human approval if autonomy drops while the gate is running', async () => {
     const f = fixture();
     f.runtime.autonomy = 'autopilot';
@@ -1024,12 +1384,15 @@ describe('dry run', () => {
     const claim = vi.spyOn(f.approvals, 'claim');
     const issue = vi.spyOn(f.approvals, 'issue');
     const lock = vi.spyOn(f.store, 'acquireLock');
-    const outcome = await applyPlan(f.plan.id, f.runtime, { ...DRY, elicitedBy: 'client', receiptId: receipt.id });
+    const guard = vi.fn(() => { throw new Error('A dry run must not call the write guard.'); });
+    const outcome = await applyPlan(f.plan.id, f.runtime, { ...DRY, elicitedBy: 'client', receiptId: receipt.id, guard });
     expect(outcome).toMatchObject({
       plan: f.plan, dryRun: true, executionId: null, applied: 0, failed: 0, skipped: 0, unknown: 0,
       ledgerSeqs: [], results: [{ status: 'pending', result: { ok: true, dryRun: true } }],
     });
     expect(f.apply.mock.calls[0]?.[1]).toEqual({ validateOnly: true, idempotencyKey: `dryrun:${f.plan.actions[0]!.id}` });
+    expect(f.apply.mock.calls[0]?.[1].beforeWrite).toBeUndefined();
+    expect(guard).not.toHaveBeenCalled();
     expect(f.states.get('ad:one')).toEqual({ status: 'ENABLED' });
     expect(save).not.toHaveBeenCalled();
     expect(claim).not.toHaveBeenCalled();

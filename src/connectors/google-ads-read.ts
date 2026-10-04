@@ -252,25 +252,29 @@ const SPECS: Partial<Record<DatasetName, DatasetSpec>> = {
   conversion_actions: {
     query: () =>
       'SELECT conversion_action.id, conversion_action.name, conversion_action.status, conversion_action.type, ' +
-      'conversion_action.category, conversion_action.primary_for_goal, conversion_action.counting_type ' +
+      'conversion_action.category, conversion_action.primary_for_goal, conversion_action.counting_type, ' +
+      'conversion_action.attribution_model_settings.attribution_model, ' +
+      'conversion_action.click_through_lookback_window_days, ' +
+      'conversion_action.view_through_lookback_window_days ' +
       'FROM conversion_action',
     toRow: (r) => {
       const id = text(r, 'conversionAction.id');
       if (id === undefined) return null;
-      return withName(
-        {
-          id,
-          metrics: {},
-          attrs: {
-            status: attr(text(r, 'conversionAction.status')),
-            type: attr(text(r, 'conversionAction.type')),
-            category: attr(text(r, 'conversionAction.category')),
-            primary: bool(r, 'conversionAction.primaryForGoal') ?? false,
-            countingType: attr(text(r, 'conversionAction.countingType')),
-          },
-        },
-        text(r, 'conversionAction.name'),
-      );
+      const attrs: Record<string, AttrValue> = {
+        status: attr(text(r, 'conversionAction.status')),
+        type: attr(text(r, 'conversionAction.type')),
+        category: attr(text(r, 'conversionAction.category')),
+        primary: bool(r, 'conversionAction.primaryForGoal') ?? false,
+        countingType: attr(text(r, 'conversionAction.countingType')),
+      };
+      // Absent attribution settings leave the key out: null would read as a recorded "none".
+      const model = at(r, 'conversionAction.attributionModelSettings.attributionModel');
+      if (typeof model === 'string' && model !== '') attrs['attributionModel'] = model;
+      const clickDays = num(r, 'conversionAction.clickThroughLookbackWindowDays');
+      if (clickDays !== undefined) attrs['clickLookbackDays'] = clickDays;
+      const viewDays = num(r, 'conversionAction.viewThroughLookbackWindowDays');
+      if (viewDays !== undefined) attrs['viewLookbackDays'] = viewDays;
+      return withName({ id, metrics: {}, attrs }, text(r, 'conversionAction.name'));
     },
   },
 };

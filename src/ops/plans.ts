@@ -130,7 +130,11 @@ export interface CycleResult {
 }
 
 /** One unattended cycle: snapshot, audit, plan, preview, and apply only what the policy lets through. */
-export async function runCycle(runtime: Runtime, input: { accountId: string; days?: number }): Promise<CycleResult> {
+export async function runCycle(
+  runtime: Runtime,
+  /** `guard` throws when the caller may no longer write (a scheduled job that lost its claim). */
+  input: { accountId: string; days?: number; guard?: () => void },
+): Promise<CycleResult> {
   const snapshot = await takeSnapshot(runtime, {
     accountId: input.accountId,
     ...(input.days !== undefined ? { days: input.days } : {}),
@@ -156,7 +160,11 @@ export async function runCycle(runtime: Runtime, input: { accountId: string; day
   }
 
   try {
-    const outcome = await applyPlan(plan.id, runtime, { dryRun: false, actor: { kind: 'system', id: 'autopilot' } });
+    const outcome = await applyPlan(plan.id, runtime, {
+      dryRun: false,
+      actor: { kind: 'system', id: 'autopilot' },
+      ...(input.guard === undefined ? {} : { guard: input.guard }),
+    });
     return {
       snapshot,
       audit,

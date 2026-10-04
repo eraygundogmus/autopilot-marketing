@@ -37,6 +37,7 @@ function setup(ttlMinutes = 30): { store: Store; service: ApprovalService; paths
     brief: path.join(dir, 'brief.md'),
     approvalKey: path.join(dir, 'keys', 'approval.key'),
     killFile: path.join(dir, 'KILL'),
+    credentials: path.join(dir, 'credentials.json'),
   };
   const store = createStore(openDatabase(paths));
   return { store, service: createApprovalService({ store, paths, ttlMinutes }), paths, dir };

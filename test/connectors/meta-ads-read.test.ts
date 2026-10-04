@@ -81,6 +81,25 @@ describe('fetchMetaAdsSnapshot', () => {
     expect(insightCall?.query?.['time_range']).toBe(JSON.stringify({ since: RANGE.start, until: RANGE.end }));
   });
 
+  it('requests the attribution windows on every insights call and records them on the snapshot', async () => {
+    const { http, calls } = fakeHttp({
+      campaigns: [{ id: 'c1', name: 'One', status: 'ACTIVE' }],
+      campaignInsights: [{ campaign_id: 'c1', impressions: '10', clicks: '1', spend: '2.5' }],
+    });
+    const deps = makeDeps(http);
+    const snapshot = await fetchMetaAdsSnapshot(deps, { account: deps.account, dateRange: RANGE });
+    const insightCalls = calls.filter((call) => new URL(call.url).pathname.endsWith('/insights'));
+    // campaign, adset, ad, placements, daily
+    expect(insightCalls).toHaveLength(5);
+    for (const call of insightCalls) {
+      expect(call.query?.['action_attribution_windows']).toBe('["7d_click","1d_view"]');
+    }
+    for (const call of calls.filter((item) => !insightCalls.includes(item))) {
+      expect(call.query?.['action_attribution_windows']).toBeUndefined();
+    }
+    expect(snapshot.attribution).toBe('7d_click,1d_view');
+  });
+
   it('throws not_configured naming the variable when the token is missing', async () => {
     const { http, calls } = fakeHttp({});
     const deps = makeDeps(http, {}, { envPrefix: 'ACME_' });

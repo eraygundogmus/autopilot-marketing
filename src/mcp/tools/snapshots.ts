@@ -193,6 +193,9 @@ function cell(value: AttrValue | undefined): string {
 
 function queryText(result: QueryResult, requested: string[] | undefined): string {
   const summary = `${result.rows.length} of ${result.total} rows (${result.dataset}, offset ${result.offset})`;
+  if (result.withheld !== undefined) {
+    return `${result.total} rows match (${result.dataset}). The owner's sharing policy for this account keeps rows on this machine: use audit_run and report_build for findings and totals.`;
+  }
   if (result.rows.length === 0) return summary;
   const columns = columnsFor(result.rows, requested);
   const lines = [

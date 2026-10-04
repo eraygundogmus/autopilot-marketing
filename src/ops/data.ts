@@ -107,6 +107,14 @@ export interface QueryResult {
   total: number;
   offset: number;
   rows: FlatRow[];
+  /** Rows of this page the owner's sharing policy keeps on this machine; `rows` is then empty. */
+  withheld?: number;
+}
+
+/** False when the owner turned row-level data off for this account (`sharing.rows: false`). */
+export function rowsShared(runtime: Runtime, accountId: string): boolean {
+  const account = runtime.config.accounts.find((candidate) => candidate.id === accountId);
+  return account?.sharing?.rows !== false;
 }
 
 type Condition = NonNullable<QueryInput['where']>[number];
@@ -249,6 +257,9 @@ export function queryData(runtime: Runtime, input: QueryInput): QueryResult {
     });
   }
 
+  if (!rowsShared(runtime, snapshot.accountId)) {
+    return { snapshotId: snapshot.id, dataset: input.dataset, total, offset, rows: [], withheld: page.length };
+  }
   return { snapshotId: snapshot.id, dataset: input.dataset, total, offset, rows: page };
 }
 
