@@ -3,6 +3,7 @@ import { sha256 } from '../core/ids';
 import type {
   ApprovalReceipt, Finding, GateDecision, Plan, PlanPreview, PolicyDecision, Runtime, Snapshot,
 } from '../core/types';
+import { withJudgmentUsage } from '../judgment/usage';
 import { renderPlanPreview } from '../report/render';
 import { evaluatePolicy } from './policy';
 
@@ -92,11 +93,12 @@ export async function previewPlan(planId: string, runtime: Runtime): Promise<Pla
   let gate: GateDecision | null = null;
   if (policy.allowed) {
     try {
-      gate = await runtime.judge.gatePlan({
-        plan,
-        policy: runtime.config.policy,
-        findings: citedFindings(plan, runtime),
-      });
+      const asked = await withJudgmentUsage(
+        runtime,
+        { operation: 'gate', accountId: account.id, planId: plan.id },
+        () => runtime.judge.gatePlan({ plan, policy: runtime.config.policy, findings: citedFindings(plan, runtime) }),
+      );
+      gate = asked.value;
     } catch {
       gate = null;
     }

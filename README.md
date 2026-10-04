@@ -168,7 +168,7 @@ Known limits:
 
 Jev is TypeSafe's System One model. It answers typed questions (yes or no, a choice, a score) instead of free text. autopilot-marketing uses it for four things: classifying search terms, verifying claims against data, screening ad copy, and the gate before an automatic apply.
 
-All requests go to a single endpoint, `POST /v1/systemone`. The estimated cost of the requests is reported with the results and recorded in the ledger.
+All requests go to a single endpoint, `POST /v1/systemone`. Each audit, judge tool call and gate check reports the estimated cost of the requests it made itself, and an operation that sent a request writes a `judgment.usage` entry to the ledger. Answers are cached locally, so asking the same question again costs nothing.
 
 Jev is used when `TYPESAFE_API_KEY` is set. Without a key, the same tools return rule-based fallbacks that are labelled as such. Fallback results are signals for review, never decisions, and the `autopilot` level behaves as `approve`.
 

@@ -8,6 +8,7 @@ import type {
   AccountConfig, Action, ActionDraft, ActionResult, ApplyOutcome, ApprovalReceipt, Connector, DatasetName,
   EntityLevel, GateDecision, JsonObject, JsonValue, LedgerEntry, LedgerInput, Plan, Runtime, Snapshot,
 } from '../core/types';
+import { withJudgmentUsage } from '../judgment/usage';
 import { actionSpec, planDigest } from './actions';
 import { createPlan } from './planner';
 import { evaluatePolicy } from './policy';
@@ -258,7 +259,12 @@ export async function applyPlan(planId: string, runtime: Runtime, options: Apply
   let gate: GateDecision | null = null;
   if (policy.autoApplicable) {
     try {
-      gate = await runtime.judge.gatePlan({ plan, policy: runtime.config.policy, findings: [] });
+      const asked = await withJudgmentUsage(
+        runtime,
+        { operation: 'gate', accountId: account.id, planId: plan.id },
+        () => runtime.judge.gatePlan({ plan, policy: runtime.config.policy, findings: [] }),
+      );
+      gate = asked.value;
     } catch {
       // An unavailable semantic gate never delegates authority.
     }

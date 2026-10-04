@@ -17,6 +17,7 @@ import type {
   Runtime,
   TermJudgment,
 } from '../core/types';
+import { withJudgmentUsage } from '../judgment/usage';
 import { snapshotTotals } from './data';
 
 const DEFAULT_TERM_LIMIT = 60;
@@ -37,14 +38,21 @@ export async function auditSnapshot(
   const snapshot = runtime.store.getSnapshot(input.snapshotId);
   const account = runtime.account(snapshot.accountId);
   const business = businessOf(runtime, account);
-  const report = await runAudit({
-    snapshot,
-    account: { ...account, ...(business === undefined ? {} : { business }) },
-    thresholds: runtime.config.thresholds,
-    judge: input.judgments === false ? null : runtime.judge,
-    ...(input.checkIds === undefined ? {} : { checkIds: input.checkIds }),
-    now: runtime.now(),
-  });
+  const { value: report, usage } = await withJudgmentUsage(
+    runtime,
+    { operation: 'audit', accountId: account.id },
+    () =>
+      runAudit({
+        snapshot,
+        account: { ...account, ...(business === undefined ? {} : { business }) },
+        thresholds: runtime.config.thresholds,
+        judge: input.judgments === false ? null : runtime.judge,
+        ...(input.checkIds === undefined ? {} : { checkIds: input.checkIds }),
+        now: runtime.now(),
+      }),
+  );
+  // What this audit used, not what the process has used since it started.
+  report.judgment = usage;
   runtime.store.saveAudit(report);
   runtime.ledger.append({
     event: 'audit.run',
@@ -135,14 +143,18 @@ export async function judgeTerms(
     });
   }
 
-  const judged =
-    terms.length === 0
-      ? []
-      : await runtime.judge.classifyTerms({
-          business: businessOf(runtime, account) ?? '',
-          brandTerms: account.brandTerms ?? [],
-          terms,
-        });
+  const { value: judged, usage } = await withJudgmentUsage(
+    runtime,
+    { operation: 'judge_terms', accountId: account.id },
+    async () =>
+      terms.length === 0
+        ? []
+        : runtime.judge.classifyTerms({
+            business: businessOf(runtime, account) ?? '',
+            brandTerms: account.brandTerms ?? [],
+            terms,
+          }),
+  );
 
   const judgments: TermsResult['judgments'] = judged.map((judgment) => {
     const row = source.get(judgment.term);
@@ -171,7 +183,7 @@ export async function judgeTerms(
     }
   }
 
-  return { judgments, negatives, usage: runtime.judge.usage() };
+  return { judgments, negatives, usage };
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -192,12 +204,17 @@ export async function judgeCopy(
       throw new AutopilotError('invalid_input', `variant ${index + 1} needs a non-empty id and body`);
     }
   });
-  const judgments = await runtime.judge.reviewCopy({
-    platform: account.platform,
-    business: businessOf(runtime, account) ?? '',
-    variants: input.variants,
-  });
-  return { judgments, usage: runtime.judge.usage() };
+  const { value: judgments, usage } = await withJudgmentUsage(
+    runtime,
+    { operation: 'judge_copy', accountId: account.id },
+    () =>
+      runtime.judge.reviewCopy({
+        platform: account.platform,
+        business: businessOf(runtime, account) ?? '',
+        variants: input.variants,
+      }),
+  );
+  return { judgments, usage };
 }
 
 function flattenCampaign(row: Row): JsonObject {
@@ -257,6 +274,8 @@ export async function judgeClaims(
     });
   }
 
-  const judgments = await runtime.judge.verifyClaims({ claims: input.claims, evidence });
-  return { judgments, usage: runtime.judge.usage() };
+  const { value: judgments, usage } = await withJudgmentUsage(runtime, { operation: 'judge_claims' }, () =>
+    runtime.judge.verifyClaims({ claims: input.claims, evidence }),
+  );
+  return { judgments, usage };
 }

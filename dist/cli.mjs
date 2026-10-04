@@ -22635,16 +22635,16 @@ function isHttp404(error62) {
 function memberSegmentIds(body) {
   const ids = /* @__PURE__ */ new Set();
   const lists = isRecord5(body) ? body["lists"] : void 0;
-  const add2 = (value) => {
+  const add3 = (value) => {
     if (typeof value === "string" || typeof value === "number") ids.add(String(value));
   };
   if (Array.isArray(lists)) {
-    for (const item of lists) add2(isRecord5(item) ? item["id"] : item);
+    for (const item of lists) add3(isRecord5(item) ? item["id"] : item);
   } else if (isRecord5(lists)) {
     for (const [key, item] of Object.entries(lists)) {
       const id = isRecord5(item) ? item["id"] : void 0;
       if (id === void 0 || id === null) ids.add(key);
-      else add2(id);
+      else add3(id);
     }
   }
   return ids;
@@ -24073,6 +24073,57 @@ function createJudge(options) {
   };
 }
 
+// src/judgment/usage.ts
+import { AsyncLocalStorage } from "node:async_hooks";
+var meters = new AsyncLocalStorage();
+function emptyMeter() {
+  return { answered: 0, model: null, requests: 0, failed: 0, skipped: 0, inputTokens: 0, outputTokens: 0, costUsd: 0 };
+}
+function add(meter, charge) {
+  meter.answered += charge.answered ?? 0;
+  meter.requests += charge.requests ?? 0;
+  meter.failed += charge.failed ?? 0;
+  meter.skipped += charge.skipped ?? 0;
+  meter.inputTokens += charge.inputTokens ?? 0;
+  meter.outputTokens += charge.outputTokens ?? 0;
+  meter.costUsd += charge.costUsd ?? 0;
+  if (typeof charge.model === "string" && charge.model !== "") meter.model = charge.model;
+}
+function chargeMeter(charge) {
+  const meter = meters.getStore();
+  if (meter !== void 0) add(meter, charge);
+}
+function usageOf(meter) {
+  const { answered, ...totals } = meter;
+  return { ...totals, mode: answered > 0 ? "jev" : "fallback" };
+}
+async function withJudgmentUsage(runtime, use, run2) {
+  const parent = meters.getStore();
+  const meter = emptyMeter();
+  try {
+    const value = await meters.run(meter, run2);
+    return { value, usage: usageOf(meter) };
+  } finally {
+    if (parent !== void 0) add(parent, meter);
+    if (meter.requests > 0 || meter.failed > 0 || meter.inputTokens > 0) {
+      runtime.ledger.append({
+        event: "judgment.usage",
+        actor: { kind: "system", id: "autopilot" },
+        ...use.accountId === void 0 ? {} : { accountId: use.accountId },
+        ...use.planId === void 0 ? {} : { planId: use.planId },
+        data: {
+          operation: use.operation,
+          model: meter.model,
+          requests: meter.requests,
+          failed: meter.failed,
+          inputTokens: meter.inputTokens,
+          costUsd: meter.costUsd
+        }
+      });
+    }
+  }
+}
+
 // src/judgment/typesafe.ts
 var TYPESAFE_URL = "https://api.typesafe.ai/v1/systemone";
 var RETRY_STATUSES = /* @__PURE__ */ new Set([429, 502, 503, 504, 529]);
@@ -24196,35 +24247,44 @@ function createTypeSafeClient(options) {
       const hit = options.cache?.get(cacheKey2);
       if (hit !== void 0) {
         answered += 1;
+        chargeMeter({ answered: 1 });
         return hit;
       }
       const body = JSON.stringify({ state, model: config2.model, questions });
       const estimate = Math.ceil(body.length / 3);
       if (totals.costUsd + estimate / 1e6 * config2.usdPerMillionInputTokens > config2.budgetUsd) {
         totals.skipped += 1;
+        chargeMeter({ skipped: 1 });
         return null;
       }
       const { parsed, readable, billedAttempts } = await send2(body);
       const reported = isRecord8(parsed) && isRecord8(parsed.usage) ? parsed.usage : {};
       const unreadable = readable ? billedAttempts - 1 : billedAttempts;
-      totals.inputTokens += unreadable * estimate;
+      let inputTokens = unreadable * estimate;
+      let outputTokens = 0;
       if (readable) {
-        totals.inputTokens += tokenCount(reported.input_tokens) ?? estimate;
-        totals.outputTokens += tokenCount(reported.output_tokens) ?? 0;
+        inputTokens += tokenCount(reported.input_tokens) ?? estimate;
+        outputTokens = tokenCount(reported.output_tokens) ?? 0;
       }
+      totals.inputTokens += inputTokens;
+      totals.outputTokens += outputTokens;
       totals.costUsd = totals.inputTokens / 1e6 * config2.usdPerMillionInputTokens;
+      chargeMeter({ inputTokens, outputTokens, costUsd: inputTokens / 1e6 * config2.usdPerMillionInputTokens });
       const answers = isRecord8(parsed) ? parseAnswers(questions, parsed.answers) : null;
       if (!isRecord8(parsed) || answers === null) {
         totals.failed += 1;
+        chargeMeter({ failed: 1 });
         return null;
       }
       totals.requests += 1;
       answered += 1;
       if (typeof parsed.model === "string" && parsed.model !== "") model = parsed.model;
+      chargeMeter({ requests: 1, answered: 1, model });
       options.cache?.set(cacheKey2, answers);
       return answers;
     } catch {
       totals.failed += 1;
+      chargeMeter({ failed: 1 });
       return null;
     }
   }
@@ -41266,7 +41326,7 @@ var SEVERITY_WEIGHT = { critical: 5, high: 3, medium: 1, low: 0.5, info: 0 };
 function emptyTally() {
   return { passWeight: 0, failWeight: 0, unknownWeight: 0, evaluated: 0, total: 0 };
 }
-function add(tally, check2) {
+function add2(tally, check2) {
   const weight = SEVERITY_WEIGHT[check2.severity];
   if (check2.status === "pass") {
     tally.passWeight += weight;
@@ -41298,13 +41358,13 @@ function scoreAudit(checks) {
   const categories = /* @__PURE__ */ new Map();
   for (const check2 of checks) {
     if (check2.status === "not_applicable") continue;
-    add(overall, check2);
+    add2(overall, check2);
     let tally = categories.get(check2.category);
     if (!tally) {
       tally = emptyTally();
       categories.set(check2.category, tally);
     }
-    add(tally, check2);
+    add2(tally, check2);
   }
   const evaluatedWeight = overall.passWeight + overall.failWeight;
   const totalWeight = evaluatedWeight + overall.unknownWeight;
@@ -41902,18 +41962,18 @@ function buildFacts(input2) {
   const { current, previous, range, currency, mismatch } = input2;
   const period = `from ${range.start} to ${range.end}`;
   const facts = [];
-  const add2 = (label3, verb, key, format) => {
+  const add3 = (label3, verb, key, format) => {
     const value = current[key];
     if (value === null) return;
     const before = previous === null || mismatch !== null && CONVERSION_KEYS.has(key) ? null : previous[key];
     const previousText = before === null ? null : format(before);
     facts.push(`${label3} ${verb} ${format(value)} ${period}${comparison(relativeChange(value, before), previousText)}.`);
   };
-  add2("Cost", "was", "cost", (value) => formatMoney(value, currency));
-  add2("Conversions", "were", "conversions", formatCount);
-  add2("CPA", "was", "cpa", (value) => formatMoney(value, currency));
-  add2("ROAS", "was", "roas", (value) => value.toFixed(2));
-  add2("CTR", "was", "ctr", (value) => formatPercent(value, 2));
+  add3("Cost", "was", "cost", (value) => formatMoney(value, currency));
+  add3("Conversions", "were", "conversions", formatCount);
+  add3("CPA", "was", "cpa", (value) => formatMoney(value, currency));
+  add3("ROAS", "was", "roas", (value) => value.toFixed(2));
+  add3("CTR", "was", "ctr", (value) => formatPercent(value, 2));
   if (mismatch !== null) {
     facts.push(
       `Conversions are not comparable between the two periods: the current period counts "${mismatch.current}", the previous one "${mismatch.previous}". Set META_CONVERSION_ACTION to fix the definition.`
@@ -42245,14 +42305,19 @@ async function auditSnapshot(runtime, input2) {
   const snapshot2 = runtime.store.getSnapshot(input2.snapshotId);
   const account = runtime.account(snapshot2.accountId);
   const business = businessOf(runtime, account);
-  const report2 = await runAudit({
-    snapshot: snapshot2,
-    account: { ...account, ...business === void 0 ? {} : { business } },
-    thresholds: runtime.config.thresholds,
-    judge: input2.judgments === false ? null : runtime.judge,
-    ...input2.checkIds === void 0 ? {} : { checkIds: input2.checkIds },
-    now: runtime.now()
-  });
+  const { value: report2, usage } = await withJudgmentUsage(
+    runtime,
+    { operation: "audit", accountId: account.id },
+    () => runAudit({
+      snapshot: snapshot2,
+      account: { ...account, ...business === void 0 ? {} : { business } },
+      thresholds: runtime.config.thresholds,
+      judge: input2.judgments === false ? null : runtime.judge,
+      ...input2.checkIds === void 0 ? {} : { checkIds: input2.checkIds },
+      now: runtime.now()
+    })
+  );
+  report2.judgment = usage;
   runtime.store.saveAudit(report2);
   runtime.ledger.append({
     event: "audit.run",
@@ -42320,11 +42385,15 @@ async function judgeTerms(runtime, input2) {
       hint: "pass a list of search terms, or the id of a snapshot that has a search_terms dataset"
     });
   }
-  const judged = terms.length === 0 ? [] : await runtime.judge.classifyTerms({
-    business: businessOf(runtime, account) ?? "",
-    brandTerms: account.brandTerms ?? [],
-    terms
-  });
+  const { value: judged, usage } = await withJudgmentUsage(
+    runtime,
+    { operation: "judge_terms", accountId: account.id },
+    async () => terms.length === 0 ? [] : runtime.judge.classifyTerms({
+      business: businessOf(runtime, account) ?? "",
+      brandTerms: account.brandTerms ?? [],
+      terms
+    })
+  );
   const judgments = judged.map((judgment) => {
     const row = source.get(judgment.term);
     if (!row) return judgment;
@@ -42350,7 +42419,7 @@ async function judgeTerms(runtime, input2) {
       });
     }
   }
-  return { judgments, negatives, usage: runtime.judge.usage() };
+  return { judgments, negatives, usage };
 }
 function isNonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0;
@@ -42366,12 +42435,16 @@ async function judgeCopy(runtime, input2) {
       throw new AutopilotError("invalid_input", `variant ${index + 1} needs a non-empty id and body`);
     }
   });
-  const judgments = await runtime.judge.reviewCopy({
-    platform: account.platform,
-    business: businessOf(runtime, account) ?? "",
-    variants: input2.variants
-  });
-  return { judgments, usage: runtime.judge.usage() };
+  const { value: judgments, usage } = await withJudgmentUsage(
+    runtime,
+    { operation: "judge_copy", accountId: account.id },
+    () => runtime.judge.reviewCopy({
+      platform: account.platform,
+      business: businessOf(runtime, account) ?? "",
+      variants: input2.variants
+    })
+  );
+  return { judgments, usage };
 }
 function flattenCampaign(row) {
   const flat = { id: row.id };
@@ -42416,8 +42489,12 @@ async function judgeClaims(runtime, input2) {
       hint: "pass a snapshotId, an auditId or evidence text"
     });
   }
-  const judgments = await runtime.judge.verifyClaims({ claims: input2.claims, evidence: evidence2 });
-  return { judgments, usage: runtime.judge.usage() };
+  const { value: judgments, usage } = await withJudgmentUsage(
+    runtime,
+    { operation: "judge_claims" },
+    () => runtime.judge.verifyClaims({ claims: input2.claims, evidence: evidence2 })
+  );
+  return { judgments, usage };
 }
 
 // src/report/render.ts
@@ -43754,7 +43831,12 @@ async function applyPlan(planId, runtime, options) {
   let gate = null;
   if (policy.autoApplicable) {
     try {
-      gate = await runtime.judge.gatePlan({ plan: plan2, policy: runtime.config.policy, findings: [] });
+      const asked = await withJudgmentUsage(
+        runtime,
+        { operation: "gate", accountId: account.id, planId: plan2.id },
+        () => runtime.judge.gatePlan({ plan: plan2, policy: runtime.config.policy, findings: [] })
+      );
+      gate = asked.value;
     } catch {
     }
   }
@@ -44154,11 +44236,12 @@ async function previewPlan(planId, runtime) {
   let gate = null;
   if (policy.allowed) {
     try {
-      gate = await runtime.judge.gatePlan({
-        plan: plan2,
-        policy: runtime.config.policy,
-        findings: citedFindings(plan2, runtime)
-      });
+      const asked = await withJudgmentUsage(
+        runtime,
+        { operation: "gate", accountId: account.id, planId: plan2.id },
+        () => runtime.judge.gatePlan({ plan: plan2, policy: runtime.config.policy, findings: citedFindings(plan2, runtime) })
+      );
+      gate = asked.value;
     } catch {
       gate = null;
     }
@@ -44797,13 +44880,13 @@ function columnsFor(rows2, requested) {
   const present = /* @__PURE__ */ new Set();
   for (const row of rows2) for (const key of Object.keys(row)) present.add(key);
   const columns = [];
-  const add2 = (field2) => {
+  const add3 = (field2) => {
     if (present.has(field2) && !columns.includes(field2)) columns.push(field2);
   };
-  add2("id");
-  add2("name");
-  for (const field2 of requested ?? USEFUL_FIELDS) add2(field2);
-  if (requested === void 0) for (const field2 of present) add2(field2);
+  add3("id");
+  add3("name");
+  for (const field2 of requested ?? USEFUL_FIELDS) add3(field2);
+  if (requested === void 0) for (const field2 of present) add3(field2);
   return columns.slice(0, MAX_COLUMNS);
 }
 function cell2(value) {
@@ -45250,13 +45333,13 @@ var USAGE = {
   revert: "autopilot-marketing revert <planId>",
   run: "autopilot-marketing run <accountId> [--days N]"
 };
-function usageOf(command) {
+function usageOf2(command) {
   return `Usage: ${USAGE[command] ?? `autopilot-marketing ${command}`}`;
 }
 function positional(ctx, command, name) {
   const value = ctx.args[0];
   if (value === void 0 || value.trim() === "") {
-    throw new AutopilotError("invalid_input", `Missing <${name}>.`, { hint: usageOf(command) });
+    throw new AutopilotError("invalid_input", `Missing <${name}>.`, { hint: usageOf2(command) });
   }
   return value;
 }
@@ -45265,7 +45348,7 @@ function stringFlag(ctx, command, name) {
   if (value === void 0 || value === false) return void 0;
   const last = Array.isArray(value) ? value[value.length - 1] : value;
   if (typeof last !== "string" || last === "") {
-    throw new AutopilotError("invalid_input", `--${name} needs a value.`, { hint: usageOf(command) });
+    throw new AutopilotError("invalid_input", `--${name} needs a value.`, { hint: usageOf2(command) });
   }
   return last;
 }
@@ -45273,7 +45356,7 @@ function intFlag(ctx, command, name) {
   const value = stringFlag(ctx, command, name);
   if (value === void 0) return void 0;
   if (!/^\d+$/.test(value)) {
-    throw new AutopilotError("invalid_input", `--${name} must be a whole number.`, { hint: usageOf(command) });
+    throw new AutopilotError("invalid_input", `--${name} must be a whole number.`, { hint: usageOf2(command) });
   }
   return Number.parseInt(value, 10);
 }
@@ -45284,7 +45367,7 @@ function csvFlag(ctx) {
   const value = ctx.flags.csv;
   if (value === void 0 || value === false) return void 0;
   const entries = Array.isArray(value) ? value : [value];
-  const hint = `${usageOf("snapshot")}. Datasets: ${DATASETS.join(", ")}`;
+  const hint = `${usageOf2("snapshot")}. Datasets: ${DATASETS.join(", ")}`;
   return entries.map((entry) => {
     const cut = typeof entry === "string" ? entry.indexOf("=") : -1;
     if (typeof entry !== "string" || cut < 1 || cut === entry.length - 1) {
@@ -45366,7 +45449,7 @@ var audit = async (ctx) => {
     const stored = ctx.runtime.store.getSnapshot(snapshotId);
     if (stored.accountId !== ctx.runtime.account(accountId).id) {
       throw new AutopilotError("invalid_input", `Snapshot ${stored.id} belongs to another account.`, {
-        hint: usageOf("audit")
+        hint: usageOf2("audit")
       });
     }
   }

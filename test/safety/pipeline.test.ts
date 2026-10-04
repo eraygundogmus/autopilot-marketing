@@ -283,6 +283,9 @@ describe('the policy is enforced by the server', () => {
     const { runtime, mcp } = await setup({ autonomy: 'approve', policy: { ...tempPolicy(), cooldownHours: 0 } });
     const snapshotId = await snapshot(mcp);
     const first = await pausePlan(mcp, snapshotId);
+    // A plan id is derived from the plan's content and its creation time in milliseconds, so the
+    // same change planned again in the same millisecond is the same plan. Let the clock move on.
+    await new Promise((resolve) => setTimeout(resolve, 5));
     const second = await pausePlan(mcp, snapshotId);
     // The same change, planned twice: once the first is applied, the second rests on a stale state.
     expect(second).not.toBe(first);

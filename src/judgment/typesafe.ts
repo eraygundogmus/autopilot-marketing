@@ -1,5 +1,6 @@
 import { canonicalJson, sha256 } from '../core/ids';
 import type { Answer, Env, JudgmentConfig, JudgmentUsage, JsonValue, Question, TypeSafeClient } from '../core/types';
+import { chargeMeter } from './usage';
 
 export const TYPESAFE_URL = 'https://api.typesafe.ai/v1/systemone';
 
@@ -160,6 +161,7 @@ export function createTypeSafeClient(options: TypeSafeOptions): TypeSafeClient {
       const hit = options.cache?.get(cacheKey);
       if (hit !== undefined) {
         answered += 1;
+        chargeMeter({ answered: 1 });
         return hit;
       }
 
@@ -167,6 +169,7 @@ export function createTypeSafeClient(options: TypeSafeOptions): TypeSafeClient {
       const estimate = Math.ceil(body.length / 3);
       if (totals.costUsd + (estimate / 1e6) * config.usdPerMillionInputTokens > config.budgetUsd) {
         totals.skipped += 1;
+        chargeMeter({ skipped: 1 });
         return null;
       }
 
@@ -175,26 +178,34 @@ export function createTypeSafeClient(options: TypeSafeOptions): TypeSafeClient {
       // unreadable response still counts against the budget.
       const reported = isRecord(parsed) && isRecord(parsed.usage) ? parsed.usage : {};
       const unreadable = readable ? billedAttempts - 1 : billedAttempts;
-      totals.inputTokens += unreadable * estimate;
+      // Counted per request, not as a difference of the totals: other requests run while this one waits.
+      let inputTokens = unreadable * estimate;
+      let outputTokens = 0;
       if (readable) {
-        totals.inputTokens += tokenCount(reported.input_tokens) ?? estimate;
-        totals.outputTokens += tokenCount(reported.output_tokens) ?? 0;
+        inputTokens += tokenCount(reported.input_tokens) ?? estimate;
+        outputTokens = tokenCount(reported.output_tokens) ?? 0;
       }
+      totals.inputTokens += inputTokens;
+      totals.outputTokens += outputTokens;
       totals.costUsd = (totals.inputTokens / 1e6) * config.usdPerMillionInputTokens;
+      chargeMeter({ inputTokens, outputTokens, costUsd: (inputTokens / 1e6) * config.usdPerMillionInputTokens });
 
       const answers = isRecord(parsed) ? parseAnswers(questions, parsed.answers) : null;
       if (!isRecord(parsed) || answers === null) {
         totals.failed += 1;
+        chargeMeter({ failed: 1 });
         return null;
       }
 
       totals.requests += 1;
       answered += 1;
       if (typeof parsed.model === 'string' && parsed.model !== '') model = parsed.model;
+      chargeMeter({ requests: 1, answered: 1, model });
       options.cache?.set(cacheKey, answers);
       return answers;
     } catch {
       totals.failed += 1;
+      chargeMeter({ failed: 1 });
       return null;
     }
   }
