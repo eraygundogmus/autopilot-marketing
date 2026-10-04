@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__plugin_autopilot-marketing_autopilot__plan_apply",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/confirm-live-apply.mjs"]
+          }
+        ]
+      }
+    ]
+  }
+}

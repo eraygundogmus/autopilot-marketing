@@ -1,0 +1,14 @@
+{
+  "name": "autopilot-marketing",
+  "owner": { "name": "Eray Gündoğmuş" },
+  "description": "Open-source ad operations engine for your own AI agent: evidence-backed audits, reviewable change plans and guarded execution, with typed judgments from Jev.",
+  "plugins": [
+    {
+      "name": "autopilot-marketing",
+      "source": "./",
+      "description": "Open-source ad operations engine for your own AI agent: evidence-backed audits, reviewable change plans and guarded execution, with typed judgments from Jev.",
+      "category": "marketing",
+      "version": "0.1.0"
+    }
+  ]
+}

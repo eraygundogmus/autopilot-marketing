@@ -1,0 +1,26 @@
+{
+  "name": "autopilot-marketing",
+  "version": "0.1.0",
+  "description": "Open-source ad operations engine for your own AI agent: evidence-backed audits, reviewable change plans and guarded execution, with typed judgments from Jev.",
+  "author": { "name": "Eray Gündoğmuş" },
+  "homepage": "https://github.com/eraygundogmus/autopilot-marketing",
+  "repository": "https://github.com/eraygundogmus/autopilot-marketing",
+  "license": "Apache-2.0",
+  "keywords": ["marketing", "mcp", "google-ads", "meta-ads", "ga4", "search-console", "mautic", "audit", "jev"],
+  "skills": "./skills/",
+  "mcpServers": "./.codex-plugin/mcp.json",
+  "interface": {
+    "displayName": "Autopilot Marketing",
+    "shortDescription": "Audit ad accounts, prepare reviewable change plans and apply only what a person approved.",
+    "longDescription": "Autopilot Marketing gives your own AI agent tools to audit ad accounts, prepare reviewable changes and apply only what a person approved. It reads Google Ads, Meta Ads, GA4, Search Console and Mautic, runs deterministic checks with the evidence behind every finding, and stores each proposed change as a plan of typed actions that can be previewed, dry-run, applied and reverted. Live changes need an approval given by a person outside the conversation, or the owner's auto-apply policy. Judgments come from Jev (TypeSafe System One) when TYPESAFE_API_KEY is set; otherwise they are labelled rule-based fallbacks that are signals for review, never decisions. Demo accounts are available out of the box.",
+    "developerName": "Eray Gündoğmuş",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"],
+    "websiteURL": "https://github.com/eraygundogmus/autopilot-marketing",
+    "defaultPrompt": [
+      "Audit the demo-google account and show the top findings with their evidence.",
+      "Build a period-over-period report for demo-meta.",
+      "Classify the search terms in demo-google and draft a plan of negative keywords for me to review."
+    ]
+  }
+}

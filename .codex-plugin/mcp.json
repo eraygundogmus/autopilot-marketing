@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "autopilot": {
+      "command": "node",
+      "args": ["./dist/cli.mjs", "mcp"],
+      "cwd": "."
+    }
+  }
+}

@@ -1,0 +1,10 @@
+node_modules/
+coverage/
+*.tsbuildinfo
+.DS_Store
+
+# local state written by the autopilot at runtime (ledger, plans, credentials)
+.autopilot/
+.env
+.env.*
+!.env.example

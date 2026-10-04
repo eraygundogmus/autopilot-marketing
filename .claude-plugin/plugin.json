@@ -1,0 +1,10 @@
+{
+  "name": "autopilot-marketing",
+  "version": "0.1.0",
+  "description": "Open-source ad operations engine for your own AI agent: evidence-backed audits, reviewable change plans and guarded execution, with typed judgments from Jev.",
+  "author": { "name": "Eray Gündoğmuş" },
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/eraygundogmus/autopilot-marketing",
+  "repository": "https://github.com/eraygundogmus/autopilot-marketing",
+  "keywords": ["marketing", "mcp", "google-ads", "meta-ads", "ga4", "search-console", "mautic", "audit", "jev"]
+}

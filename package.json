@@ -1,0 +1,56 @@
+{
+  "name": "autopilot-marketing",
+  "version": "0.1.0",
+  "description": "Open-source ad operations engine for your own AI agent: evidence-backed audits, reviewable change plans and guarded execution over MCP, with typed judgments from Jev.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eraygundogmus/autopilot-marketing.git"
+  },
+  "homepage": "https://github.com/eraygundogmus/autopilot-marketing",
+  "bugs": "https://github.com/eraygundogmus/autopilot-marketing/issues",
+  "keywords": [
+    "marketing",
+    "mcp",
+    "claude-code",
+    "codex",
+    "google-ads",
+    "meta-ads",
+    "mautic",
+    "agent-skills",
+    "autopilot"
+  ],
+  "engines": {
+    "node": ">=22.13"
+  },
+  "bin": {
+    "autopilot-marketing": "dist/cli.mjs"
+  },
+  "files": [
+    "dist",
+    "skills",
+    "agents",
+    "commands",
+    "hooks",
+    ".claude-plugin",
+    ".mcp.json",
+    "AGENTS.md"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "npm run typecheck && npm test && npm run build && node scripts/verify-dist.mjs"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "^2.3.0",
+    "@modelcontextprotocol/server": "^2.3.0",
+    "@types/node": "^24.19.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3",
+    "zod": "^4.6.5"
+  }
+}
